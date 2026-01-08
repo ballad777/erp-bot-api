@@ -6,6 +6,7 @@ import base64
 import hashlib
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, Query, Request, HTTPException
 from sqlalchemy import create_engine, text
 
@@ -18,13 +19,19 @@ if not DATABASE_URL:
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
-app = FastAPI(title="ERP Bot API", version="1.0")
+app = FastAPI(title="ERP Bot API", version="2.0")
 
 # =========================
 # LINE
 # =========================
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")  # 可先不設；設了會驗簽更安全
+
+# =========================
+# Gemini
+# =========================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Render Environment Variables 設定
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")  # 可選：gemini-1.5-pro 等
 
 
 def _verify_line_signature(body_bytes: bytes, signature: str) -> bool:
@@ -42,7 +49,6 @@ def _extract_year(text_in: str) -> Optional[int]:
 
 
 def _extract_top_n(text_in: str, default: int = 10) -> int:
-    # 例：前5、TOP 5、top5
     m = re.search(r"(?:前|top|TOP)\s*(\d+)", text_in)
     if m:
         n = int(m.group(1))
@@ -71,6 +77,9 @@ def _format_top_list(title: str, rows: list[dict], key_name: str) -> str:
     return "\n".join(lines)
 
 
+# =========================
+# DB helpers
+# =========================
 def _sales_summary(year: int) -> dict:
     sql = text("""
         SELECT
@@ -254,15 +263,11 @@ def purchase_search(
 
 
 # =========================
-# LINE Webhook (回你要的資料)
+# LINE reply
 # =========================
 async def _line_reply(reply_token: str, text_message: str):
     if not LINE_CHANNEL_ACCESS_TOKEN:
-        # 沒設 token 也別讓 webhook 500
         return
-
-    import httpx  # ← 需要 requirements.txt 加一行 httpx
-
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
@@ -274,26 +279,15 @@ async def _line_reply(reply_token: str, text_message: str):
     }
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(url, headers=headers, json=payload)
-        # 不要讓 webhook 因為回覆失敗而整個炸掉
         if r.status_code >= 400:
             print("LINE reply error:", r.status_code, r.text)
 
 
-def _handle_query(user_text: str) -> str:
+# =========================
+# 你原本的規則引擎（保留當 fallback）
+# =========================
+def _handle_query_rule_based(user_text: str) -> str:
     t = user_text.strip()
-
-    # 指令提示
-    if t.lower() in {"help", "h", "指令", "幫助"}:
-        return (
-            "可用指令：\n"
-            "1) 銷售總覽 2025\n"
-            "2) 銷售前10產品 2025（可改前5/前20）\n"
-            "3) 銷售前10客戶 2025\n"
-            "4) 銷售搜尋 2025 關鍵字（或：銷售搜尋 關鍵字）\n"
-            "5) 進貨總覽 2024\n"
-            "6) 進貨前10產品 2024\n"
-            "7) 進貨搜尋 2024 關鍵字\n"
-        )
 
     year = _extract_year(t)
     n = _extract_top_n(t, default=10)
@@ -319,7 +313,6 @@ def _handle_query(user_text: str) -> str:
             return _format_top_list(f"【銷售 前{n} 客戶｜依數量】(年 {year})", rows, "customer")
 
         if "搜尋" in t or "search" in t.lower():
-            # 允許：銷售搜尋 2025 xxx / 銷售搜尋 xxx
             keyword = re.sub(r"(銷售\s*)?(搜尋|search)\s*", "", t, flags=re.IGNORECASE).strip()
             if year:
                 keyword = re.sub(r"20\d{2}", "", keyword).strip()
@@ -333,7 +326,7 @@ def _handle_query(user_text: str) -> str:
                 lines.append(f"{r['date']}｜{r['customer']}｜{r['product']}｜數量 {r['quantity']}｜金額 {r['amount']}")
             return "\n".join(lines)
 
-        return "我看得懂銷售：總覽/前N產品/前N客戶/搜尋。打「指令」看範例。"
+        return "我看得懂銷售：總覽/前N產品/前N客戶/搜尋。"
 
     # 進貨
     if "進貨" in t or "採購" in t:
@@ -363,11 +356,156 @@ def _handle_query(user_text: str) -> str:
                 lines.append(f"{r['date']}｜{r['supplier']}｜{r['product']}｜數量 {r['quantity']}｜金額 {r['amount']}")
             return "\n".join(lines)
 
-        return "我看得懂進貨：總覽/前N產品/搜尋。打「指令」看範例。"
+        return "我看得懂進貨：總覽/前N產品/搜尋。"
 
-    return "我不知道你要查什麼。打「指令」我會給你可用格式。"
+    # 其他
+    return "請說明你要查：銷售/進貨 + 年份 + (總覽/前N/搜尋)。"
 
 
+# =========================
+# Gemini intent -> 轉成你原本的查詢動作
+# =========================
+def _strip_code_fence(s: str) -> str:
+    s = s.strip()
+    # 可能回 ```json ... ```
+    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+
+async def _gemini_intent(user_text: str) -> Optional[dict]:
+    """回傳 dict: {action, table, year, n, keyword, limit}；失敗回 None"""
+    if not GEMINI_API_KEY:
+        return None
+
+    sys_prompt = f"""
+你是 ERP 查詢意圖解析器。只能回「純 JSON」，不要加任何說明文字。
+你要把使用者的中文輸入，解析成以下欄位（能給就給，不能給就用 null）：
+
+action: one of
+- sales_summary
+- sales_top_products
+- sales_top_customers
+- sales_search
+- purchase_summary
+- purchase_top_products
+- purchase_search
+
+year: 4位數年份 (例如 2025) 或 null
+n: top N (1~100) 或 null
+keyword: 搜尋關鍵字（客戶/品號/供應商/產品）或 null
+limit: 搜尋回傳筆數（1~200）或 null
+
+規則：
+- 如果使用者問「最熱賣 / 前幾名 / top」，優先用 *_top_* action
+- 如果使用者提到「客戶排名」，用 sales_top_customers
+- 如果使用者提到「供應商」或「進貨/採購」，用 purchase_* action
+- 如果使用者提到「搜尋/查/找」，用 *_search action，keyword 必填
+- 如果沒講年份但很明確是今年/去年也不要猜，year 回 null
+- 只輸出 JSON
+"""
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [
+            {"role": "user", "parts": [{"text": sys_prompt}]},
+            {"role": "user", "parts": [{"text": f"使用者輸入：{user_text}"}]},
+        ]
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+
+        text_out = data["candidates"][0]["content"]["parts"][0]["text"]
+        text_out = _strip_code_fence(text_out)
+        intent = json.loads(text_out)
+
+        # 簡單清理
+        if "n" in intent and intent["n"] is not None:
+            intent["n"] = max(1, min(100, int(intent["n"])))
+        if "limit" in intent and intent["limit"] is not None:
+            intent["limit"] = max(1, min(200, int(intent["limit"])))
+
+        return intent
+    except Exception as e:
+        print("Gemini intent error:", str(e))
+        return None
+
+
+def _run_intent(intent: dict, original_text: str) -> str:
+    action = intent.get("action")
+    year = intent.get("year")
+    n = intent.get("n") or _extract_top_n(original_text, 10)
+    keyword = intent.get("keyword")
+    limit = intent.get("limit") or 20
+
+    # sales
+    if action == "sales_summary":
+        if not year:
+            return "請補年份，例如：2025 銷售總覽"
+        d = _sales_summary(int(year))
+        return _format_kv("【銷售總覽】", d)
+
+    if action == "sales_top_products":
+        if not year:
+            return "請補年份，例如：2025 銷售前10產品"
+        rows = _sales_top_products(int(year), int(n))
+        return _format_top_list(f"【銷售 前{n} 產品｜依數量】(年 {year})", rows, "product")
+
+    if action == "sales_top_customers":
+        if not year:
+            return "請補年份，例如：2025 銷售前10客戶"
+        rows = _sales_top_customers(int(year), int(n))
+        return _format_top_list(f"【銷售 前{n} 客戶｜依數量】(年 {year})", rows, "customer")
+
+    if action == "sales_search":
+        if not keyword:
+            return "請給關鍵字，例如：銷售搜尋 ABC（可加年份：2025）"
+        rows = _sales_search(str(keyword), int(year) if year else None, limit=int(limit))
+        if not rows:
+            return f"找不到：{keyword}"
+        lines = [f"【銷售搜尋】{keyword}（年：{year if year else '不限'}）"]
+        for r in rows[:20]:
+            lines.append(f"{r['date']}｜{r['customer']}｜{r['product']}｜數量 {r['quantity']}｜金額 {r['amount']}")
+        return "\n".join(lines)
+
+    # purchase
+    if action == "purchase_summary":
+        if not year:
+            return "請補年份，例如：2024 進貨總覽"
+        d = _purchase_summary(int(year))
+        return _format_kv("【進貨總覽】", d)
+
+    if action == "purchase_top_products":
+        if not year:
+            return "請補年份，例如：2024 進貨前10產品"
+        rows = _purchase_top_products(int(year), int(n))
+        return _format_top_list(f"【進貨 前{n} 產品｜依數量】(年 {year})", rows, "product")
+
+    if action == "purchase_search":
+        if not keyword:
+            return "請給關鍵字，例如：進貨搜尋 ABC（可加年份：2024）"
+        rows = _purchase_search(str(keyword), int(year) if year else None, limit=int(limit))
+        if not rows:
+            return f"找不到：{keyword}"
+        lines = [f"【進貨搜尋】{keyword}（年：{year if year else '不限'}）"]
+        for r in rows[:20]:
+            lines.append(f"{r['date']}｜{r['supplier']}｜{r['product']}｜數量 {r['quantity']}｜金額 {r['amount']}")
+        return "\n".join(lines)
+
+    # unknown -> fallback
+    return _handle_query_rule_based(original_text)
+
+
+# =========================
+# LINE Webhook
+# =========================
 @app.post("/line/webhook")
 async def line_webhook(request: Request):
     body_bytes = await request.body()
@@ -388,9 +526,19 @@ async def line_webhook(request: Request):
             continue
 
         reply_token = ev.get("replyToken")
-        user_text = msg.get("text", "")
+        user_text = msg.get("text", "").strip()
+        if not reply_token or not user_text:
+            continue
 
-        answer = _handle_query(user_text)
+        # 1) 先走 Gemini 意圖（有 key 才用）
+        intent = await _gemini_intent(user_text)
+
+        # 2) 有意圖就跑意圖；沒有就 fallback 你原本規則
+        if intent and isinstance(intent, dict) and intent.get("action"):
+            answer = _run_intent(intent, user_text)
+        else:
+            answer = _handle_query_rule_based(user_text)
+
         await _line_reply(reply_token, answer)
 
     return {"status": "ok"}
