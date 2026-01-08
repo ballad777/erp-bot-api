@@ -1,7 +1,11 @@
 import os
-from fastapi import FastAPI, Query
+import json
+from fastapi import FastAPI, Query, Request
 from sqlalchemy import create_engine, text
 
+# -------------------------
+# DB
+# -------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("找不到 DATABASE_URL 環境變數")
@@ -62,7 +66,6 @@ def sales_top_products(
     year: int = Query(..., description="年份，例如 2025"),
     n: int = Query(10, ge=1, le=100, description="回傳前 N 名")
 ):
-    # ✅ 依數量排序（你要求的）
     sql = text("""
         SELECT
             product,
@@ -85,7 +88,6 @@ def sales_top_customers(
     year: int = Query(..., description="年份，例如 2025"),
     n: int = Query(10, ge=1, le=100, description="回傳前 N 名")
 ):
-    # ✅ 依數量排序（你要求的）
     sql = text("""
         SELECT
             customer,
@@ -192,3 +194,13 @@ def purchase_search(
         rows = conn.execute(sql, params).mappings().all()
 
     return {"q": q, "year": year, "limit": limit, "rows": [dict(r) for r in rows]}
+
+
+# -------------------------
+# LINE Webhook (test only)
+# -------------------------
+@app.post("/line/webhook")
+async def line_webhook(request: Request):
+    body = await request.json()
+    print(json.dumps(body, ensure_ascii=False, indent=2))
+    return {"status": "ok"}
