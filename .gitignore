@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+
+# Excel source files
+*.xlsx
+~$*.xlsx
+
+# Env
+.env
