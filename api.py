@@ -45,7 +45,7 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 if not LINE_CHANNEL_ACCESS_TOKEN:
-    logger.warning("⚠️ LINE_CHANNEL_ACCESS_TOKEN 未設定")
+    logger.warning(⚠️ LINE_CHANNEL_ACCESS_TOKEN 未設定")
 if not GEMINI_API_KEY:
     logger.warning("⚠️ GEMINI_API_KEY 未設定")
 
@@ -262,7 +262,7 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
             logger.info(f"Agent 第 {turn} 輪處理")
             
             response = client.models.generate_content(
-                model="gemini-1.0-pro",
+                model="gemini-2.0-flash",
                 contents=contents,
                 config=config
             )
@@ -583,14 +583,6 @@ async def reply_line(token: str, text: Optional[str], img_url: Optional[str]):
 async def startup():
     """應用啟動時執行"""
     logger.info("🚀 應用啟動中...")
-# === 新增這段除錯程式碼 ===
-    try:
-        logger.info("📋 正在查詢可用模型清單...")
-        for m in client.models.list():
-            logger.info(f"發現模型: {m.name}")
-    except Exception as e:
-        logger.error(f"❌ 無法列出模型: {str(e)}")
-    # ==========================
     
     # 測試資料庫連線
     try:
