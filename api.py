@@ -65,7 +65,7 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 genai.configure(api_key=GEMINI_API_KEY)
 
 # 你可以改成 gemini-1.5-pro（更準更貴）
-GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-flash")
+GEMINI_MODEL = genai.GenerativeModel("models/gemini-1.5-flash")
 
 
 # ============================================================
