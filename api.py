@@ -11,7 +11,7 @@ from datetime import datetime
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import Response, JSONResponse
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect
 import pandas as pd
 import httpx
 
@@ -28,7 +28,7 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Smart ERP Bot", version="Final_Drive_Integrated")
+app = FastAPI(title="Smart ERP Bot", version="Final_Postgres_Compatible")
 
 # =========================
 # 資料庫連線
@@ -37,6 +37,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 if not DATABASE_URL:
+    # 本地測試用 SQLite
     DATABASE_URL = "sqlite:///./erp.db"
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -160,8 +161,10 @@ def import_data_to_db():
             
             for sheet_name, df in xls.items():
                 logger.info(f"  - 處理分頁: {sheet_name}")
-                # 檢查必要欄位 (根據您提供的 CSV 欄位名稱)
-                # 欄位: 日期(轉換), 客戶供應商簡稱, 品名, 數量, 進銷明細未稅金額
+                # 清洗欄位名稱 (移除空格)
+                df.columns = df.columns.str.strip()
+                
+                # 檢查必要欄位
                 if '日期(轉換)' in df.columns and '進銷明細未稅金額' in df.columns:
                     clean_df = pd.DataFrame({
                         'date': pd.to_datetime(df['日期(轉換)'], errors='coerce'),
@@ -193,7 +196,8 @@ def import_data_to_db():
             
             for sheet_name, df in xls.items():
                 logger.info(f"  - 處理分頁: {sheet_name}")
-                # 欄位: 日期(轉換), 客戶供應商簡稱, 對方品名/品名備註, 數量, 進銷明細未稅金額
+                df.columns = df.columns.str.strip()
+                
                 if '日期(轉換)' in df.columns and '進銷明細未稅金額' in df.columns:
                     # 採購檔的品名欄位可能不同，嘗試找 '對方品名/品名備註'
                     prod_col = '對方品名/品名備註' if '對方品名/品名備註' in df.columns else '品名'
@@ -240,17 +244,20 @@ def execute_sql_query(sql: str) -> str:
         return "錯誤：禁止修改資料庫。"
     
     try:
-        with engine.connect() as conn:
-            # 檢查 Table 是否存在 (防止 'no such table' 錯誤)
-            tables = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
-            table_names = [t[0] for t in tables]
-            
-            # 如果 SQL 裡提到的表不存在，回傳友善錯誤
-            if 'sales' in sql_lower and 'sales' not in table_names:
-                return "系統錯誤：銷售資料表 (sales) 尚未建立，請聯繫管理員檢查資料匯入狀況。"
-            if 'purchase' in sql_lower and 'purchase' not in table_names:
-                return "系統錯誤：採購資料表 (purchase) 尚未建立。"
+        # ==========================================
+        # ✅ 修正點：使用 SQLAlchemy inspect 檢查表是否存在
+        # 這能同時相容 SQLite 和 PostgreSQL
+        # ==========================================
+        insp = inspect(engine)
+        table_names = insp.get_table_names()
+        
+        # 如果 SQL 裡提到的表不存在，回傳友善錯誤
+        if 'sales' in sql_lower and 'sales' not in table_names:
+            return "系統錯誤：銷售資料表 (sales) 尚未建立，請確認資料是否已匯入。"
+        if 'purchase' in sql_lower and 'purchase' not in table_names:
+            return "系統錯誤：採購資料表 (purchase) 尚未建立。"
 
+        with engine.connect() as conn:
             df = pd.read_sql(text(sql), conn)
             
             if df.empty: 
@@ -308,15 +315,25 @@ def create_chart(title: str, chart_type: str, data_json: str, x_key: str, y_key:
 def get_database_schema() -> str:
     """【工具】取得資料表結構"""
     try:
+        # ==========================================
+        # ✅ 修正點：使用 SQLAlchemy inspect 取得 Schema
+        # ==========================================
+        insp = inspect(engine)
+        table_names = insp.get_table_names()
+        
+        summary = {}
         with engine.connect() as conn:
-            tables = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
-            summary = {}
-            for t in tables:
-                t_name = t[0]
+            for t_name in table_names:
+                # 只關心 sales 和 purchase
+                if t_name not in ['sales', 'purchase']:
+                    continue
+                    
+                # 取得第一列來當作範例
                 cols = conn.execute(text(f"SELECT * FROM {t_name} LIMIT 1")).keys()
                 count = conn.execute(text(f"SELECT COUNT(*) FROM {t_name}")).scalar()
                 summary[t_name] = {'columns': list(cols), 'count': count}
-            return json.dumps(summary, ensure_ascii=False)
+                
+        return json.dumps(summary, ensure_ascii=False)
     except Exception as e:
         return f"Error: {str(e)}"
 
