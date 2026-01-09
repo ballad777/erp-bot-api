@@ -13,7 +13,7 @@ import pandas as pd
 import httpx
 
 import matplotlib
-# 設定 Matplotlib 後端為 Agg (必須在 pyplot 匯入前設定)
+# ✅ 設定 Matplotlib 後端為 Agg (防止伺服器繪圖錯誤)
 matplotlib.use("Agg") 
 import matplotlib.pyplot as plt
 from io import BytesIO
@@ -25,7 +25,7 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Smart ERP Bot", version="Final_Search_Enabled")
+app = FastAPI(title="Smart ERP Bot", version="Excel_Only_Fuzzy_Match")
 
 # =========================
 # 資料庫連線
@@ -61,7 +61,7 @@ CHAT_MEMORY: Dict[str, List[Any]] = {}
 IMG_STORE: Dict[str, Dict[str, Any]] = {}
 
 # =========================
-# 工具函數 (Python Functions)
+# 工具函數 (Python Functions - 處理 Excel 資料庫)
 # =========================
 def execute_sql_query(sql: str) -> str:
     """【工具】執行 SQL SELECT 查詢 sales 或 purchase 表。"""
@@ -79,15 +79,17 @@ def execute_sql_query(sql: str) -> str:
     
     try:
         with engine.connect() as conn:
+            # 執行查詢
             df = pd.read_sql(text(sql), conn)
-            if df.empty: 
-                return "查詢成功但無資料。"
             
-            # 處理日期時間欄位
+            if df.empty: 
+                return "查詢成功但沒有找到符合的資料 (No Data Found)。"
+            
+            # 處理日期時間欄位，轉成字串
             for col in df.select_dtypes(include=['datetime64']).columns:
                 df[col] = df[col].astype(str)
             
-            # 限制回傳筆數避免過大
+            # 限制回傳筆數 (如果超過 100 筆，只回傳前 100 筆並提示)
             if len(df) > 100:
                 logger.info(f"結果筆數過多 ({len(df)})，僅回傳前 100 筆")
                 df = df.head(100)
@@ -95,10 +97,11 @@ def execute_sql_query(sql: str) -> str:
             return df.to_json(orient="records", force_ascii=False, date_format='iso')
     except Exception as e:
         logger.error(f"SQL 執行錯誤: {str(e)}")
-        return f"SQL Error: {str(e)}"
+        # 回傳錯誤訊息給 AI，讓 AI 知道 SQL 寫錯了，它可以嘗試修正
+        return f"SQL Execution Error: {str(e)}"
 
 def create_chart(title: str, chart_type: str, data_json: str, x_key: str, y_key: str) -> str:
-    """【工具】繪製圖表。data_json 必須是有效的 JSON 字串。"""
+    """【工具】繪製圖表。"""
     logger.info(f"繪製圖表: {title} ({chart_type})")
     
     try:
@@ -106,16 +109,17 @@ def create_chart(title: str, chart_type: str, data_json: str, x_key: str, y_key:
         df = pd.DataFrame(data)
         
         if df.empty: 
-            return "無資料繪圖。"
+            return "無資料可繪圖。"
         
         if x_key not in df.columns or y_key not in df.columns:
-            return f"錯誤：找不到欄位 {x_key} 或 {y_key}"
+            return f"錯誤：找不到欄位 {x_key} 或 {y_key}，現有欄位: {list(df.columns)}"
         
         # 數值轉換
         df[y_key] = pd.to_numeric(df[y_key], errors='coerce').fillna(0)
         
-        # 繪圖
+        # 繪圖設定
         plt.figure(figsize=(10, 6))
+        # 設定通用中文字型
         plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'Arial Unicode MS', 'sans-serif']
         plt.rcParams['axes.unicode_minus'] = False
         
@@ -147,74 +151,91 @@ def create_chart(title: str, chart_type: str, data_json: str, x_key: str, y_key:
         logger.info(f"圖表生成成功: {img_id}")
         return f"IMAGE_ID:{img_id}"
     except json.JSONDecodeError as e:
-        logger.error(f"JSON 解析錯誤: {str(e)}")
         return f"JSON 格式錯誤: {str(e)}"
     except Exception as e:
         logger.error(f"圖表生成錯誤: {str(e)}")
         return f"Chart Error: {str(e)}"
 
 def get_database_schema() -> str:
-    """【工具】取得資料庫結構資訊"""
+    """【工具】取得資料庫結構資訊。"""
     try:
         with engine.connect() as conn:
-            # 嘗試取得資料表結構，若無資料表則回傳錯誤
-            sales_info = conn.execute(text("SELECT * FROM sales LIMIT 1")).keys()
-            purchase_info = conn.execute(text("SELECT * FROM purchase LIMIT 1")).keys()
-            
+            # 取得 Sales 表資訊
+            sales_cols = conn.execute(text("SELECT * FROM sales LIMIT 1")).keys()
             sales_count = conn.execute(text("SELECT COUNT(*) FROM sales")).scalar()
+            
+            # 取得 Purchase 表資訊
+            purchase_cols = conn.execute(text("SELECT * FROM purchase LIMIT 1")).keys()
             purchase_count = conn.execute(text("SELECT COUNT(*) FROM purchase")).scalar()
             
+            # 讓 AI 知道欄位名稱和資料量，方便它寫 SQL
             return json.dumps({
-                "tables": {
-                    "sales": {
-                        "columns": list(sales_info),
-                        "count": sales_count
+                "database_summary": {
+                    "sales_table": {
+                        "description": "銷售資料表",
+                        "columns": list(sales_cols),
+                        "total_rows": sales_count,
+                        "example_columns": ["date", "customer", "product", "quantity", "amount", "year"]
                     },
-                    "purchase": {
-                        "columns": list(purchase_info),
-                        "count": purchase_count
+                    "purchase_table": {
+                        "description": "採購資料表",
+                        "columns": list(purchase_cols),
+                        "total_rows": purchase_count,
+                        "example_columns": ["date", "supplier", "product", "quantity", "amount", "year"]
                     }
                 }
             }, ensure_ascii=False)
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"Schema Error: {str(e)}"
 
 # =========================
-# 系統提示詞
+# 工具列表 (只保留 Excel 相關)
 # =========================
-SYSTEM_PROMPT = """你是一個智能 ERP 助理，名字是「小智」。你擁有以下能力：
+tools_list = [execute_sql_query, create_chart, get_database_schema]
 
-## 📊 資料庫查詢能力
-- 可以查詢 'sales'（銷售）和 'purchase'（採購）兩張表
-- sales 欄位：date(日期), customer(客戶), product(產品), quantity(數量), amount(金額), year(年份)
-- purchase 欄位：date(日期), supplier(供應商), product(產品), quantity(數量), amount(金額), year(年份)
+# =========================
+# 系統提示詞 (強調模糊比對與糾錯)
+# =========================
+SYSTEM_PROMPT = """你是一個極度聰明的 ERP 數據助理，名字是「小智」。
+你的任務是查詢資料庫並回答用戶關於「銷售 (sales)」與「採購 (purchase)」的問題。
 
-## 🎨 資料視覺化能力
-- 可以繪製折線圖(line)、長條圖(bar)、圓餅圖(pie)
-- 繪圖時必須先用 execute_sql_query 取得資料，再用 create_chart 繪製
+## 🧠 你的核心能力：模糊比對與糾錯
+用戶輸入的查詢可能會有錯字、簡寫或模糊不清，你必須**先推測用戶的真實意圖**，再撰寫 SQL。
 
-## 🌐 網路搜尋能力 (Google Search)
-- **當用戶問的問題不在資料庫中（例如：最新新聞、NBA 比分、天氣、匯率、歷史事件等），請務必使用 google_search 工具查詢最新資訊。**
-- 不要在沒有搜尋的情況下編造即時資訊。
+1. **自動修正錯字**：
+   - 如果用戶輸入 "ipone"，你要知道他在查 "iPhone"，SQL 請用 `WHERE product LIKE '%iPhone%'`。
+   - 如果用戶輸入 "Samung"，你要修正為 "Samsung"。
+   - 如果用戶輸入 "電腦"，SQL 請用 `LIKE '%電腦%'` 或 `LIKE '%PC%'` (根據你對產品的理解)。
 
-## 💬 對話原則
-1. **主動積極**：不要只是回答問題，要主動提供洞察和建議
-2. **數據驅動**：盡可能用實際數據支持你的回答
-3. **視覺化優先**：當數據適合視覺化時，主動建議或直接繪圖
-4. **友善專業**：使用繁體中文，語氣友善但專業
+2. **模糊查詢**：
+   - 除非用戶指定確切名稱，否則查詢文字欄位時，請一律使用 `LIKE %關鍵字%`。
+   - 範例：查 "華碩"，SQL 應為 `WHERE customer LIKE '%華碩%' OR product LIKE '%華碩%'`。
+
+3. **資料表結構**：
+   - **sales (銷售)**: date, customer, product, quantity, amount, year
+   - **purchase (採購)**: date, supplier, product, quantity, amount, year
+
+## 📝 SQL 撰寫規則
+- 只使用 SELECT。
+- 字串比對一律加上單引號，例如 `product = 'iPhone 15'`。
+- 日期格式通常為 'YYYY-MM-DD'。
+- 如果用戶問「總額」或「多少錢」，請使用 `SUM(amount)`。
+- 如果用戶問「銷量」或「多少個」，請使用 `SUM(quantity)`。
 
 ## 🚫 限制
-- 只能執行 SELECT 查詢，不能修改資料庫
-- 繪圖時 data_json 必須是有效的 JSON 字串格式
+- **絕對不要使用 Google 搜尋**，你只能查資料庫。
+- 如果資料庫查不到，請嘗試放寬 SQL 條件 (例如把 `AND` 改成 `OR`，或是減少 WHERE 條件) 再查一次。
+
+記住：你的目標是**無論用戶怎麼問、字怎麼打，都要盡力從資料庫挖出相關的資料**！
 """
 
 # =========================
 # Agent 處理邏輯
 # =========================
 async def agent_process(user_id: str, text: str, base_url: str, max_turns: int = 5):
-    """處理對話，支援 SQL、繪圖與 Google 搜尋"""
+    """處理對話"""
     if not client: 
-        return {"text": "❌ Gemini API Key 未設定"}
+        return {"text": "❌ Gemini API Key 未設定，請檢查環境變數"}
     
     history = CHAT_MEMORY.get(user_id, [])
     
@@ -226,23 +247,10 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
         
         contents = history + [user_message]
         
-        # ==========================================
-        # ✅ 關鍵修復：正確定義並混合 Google Search 工具
-        # ==========================================
-        
-        # 1. 定義搜尋工具 (正確的 SDK 寫法)
-        google_search_tool = types.Tool(
-            google_search=types.GoogleSearch()
-        )
-        
-        # 2. 混合 Python 函式與搜尋工具
-        # 我們將自定義函式與 google_search_tool 放在同一個清單中傳給 config
-        my_tools = [execute_sql_query, create_chart, get_database_schema, google_search_tool]
-        
         config = types.GenerateContentConfig(
-            tools=my_tools, 
+            tools=tools_list, 
             system_instruction=SYSTEM_PROMPT,
-            temperature=0.7
+            temperature=0.4  # 降低隨機性，讓 SQL 更精確
         )
         
         final_text = ""
@@ -253,13 +261,9 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
             turn += 1
             logger.info(f"Agent 第 {turn} 輪處理")
             
-            # ==========================================
-            # ✅ 關鍵修復：使用 gemini-1.5-flash
-            # 原因：1.5-flash 是目前最穩定支援「工具混用(SQL+Search)」的版本
-            # 2.0 版本目前會報 "unsupported" 錯誤
-            # ==========================================
+            # ✅ 使用您日誌中出現過的可用模型
             response = client.models.generate_content(
-                model="gemini-1.5-flash",
+                model="gemini-flash-latest",
                 contents=contents,
                 config=config
             )
@@ -271,7 +275,7 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
             candidate = response.candidates[0]
             content = candidate.content
             
-            # 檢查是否有工具調用
+            # 檢查 Function Call
             has_function_call = any(
                 part.function_call for part in content.parts if hasattr(part, 'function_call')
             )
@@ -284,11 +288,10 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
                         continue
                         
                     fc = part.function_call
-                    logger.info(f"調用工具: {fc.name}")
+                    logger.info(f"調用工具: {fc.name} | 參數: {fc.args}")
                     
                     tool_result = ""
                     
-                    # 處理自定義 Python 工具
                     if fc.name == "execute_sql_query":
                         tool_result = execute_sql_query(fc.args.get("sql", ""))
                     elif fc.name == "create_chart":
@@ -308,11 +311,7 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
                     elif fc.name == "get_database_schema":
                         tool_result = get_database_schema()
                     else:
-                        # 如果是 Google Search，模型通常會自己在伺服器端執行，
-                        # 但如果跑到這裡，代表模型可能嘗試用 function call 的方式回傳。
-                        # 對於 gemini-1.5-flash，通常它會自動處理 search，
-                        # 我們只需回傳一個空的或提示訊息讓它繼續。
-                        tool_result = f"工具 {fc.name} 已被調用"
+                        tool_result = f"未知工具: {fc.name}"
                     
                     function_responses.append(
                         types.Part(
@@ -323,7 +322,6 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
                         )
                     )
                 
-                # 將工具執行結果回傳給模型
                 contents.append(content)
                 contents.append(types.Content(
                     role="user",
@@ -331,7 +329,6 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
                 ))
                 
             else:
-                # 沒有工具調用，代表已生成最終回應
                 final_text = response.text
                 break
         
@@ -344,14 +341,14 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
         
     except Exception as e:
         logger.error(f"Agent 處理錯誤: {str(e)}", exc_info=True)
-        return {"text": f"❌ 發生錯誤：{str(e)}"}
+        return {"text": f"❌ 系統錯誤：{str(e)}"}
 
 # =========================
 # API 端點
 # =========================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Smart ERP Bot (Search Enabled)"}
+    return {"status": "ok", "service": "Smart ERP Bot (Excel Only)"}
 
 @app.get("/health")
 def health_check():
@@ -405,11 +402,7 @@ async def handle_message(user_id: str, text: str, reply_token: str, base_url: st
             await reply_line(reply_token, "記憶已清除", None)
             return
         
-        # 顯示歡迎/幫助訊息
-        if text.lower() in ['/help', '/說明', '說明']:
-            await reply_line(reply_token, "我可以查資料庫（銷售/採購），也可以上網搜尋（NBA、天氣）。請直接問我問題！", None)
-            return
-
+        # Agent 處理
         result = await agent_process(user_id, text, base_url)
         await reply_line(reply_token, result.get("text"), result.get("image"))
     except Exception as e:
