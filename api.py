@@ -45,7 +45,7 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 if not LINE_CHANNEL_ACCESS_TOKEN:
-    logger.warning(⚠️ LINE_CHANNEL_ACCESS_TOKEN 未設定")
+    logger.warning("⚠️ LINE_CHANNEL_ACCESS_TOKEN 未設定")
 if not GEMINI_API_KEY:
     logger.warning("⚠️ GEMINI_API_KEY 未設定")
 
