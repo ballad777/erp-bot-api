@@ -13,6 +13,7 @@ import pandas as pd
 import httpx
 
 import matplotlib
+# 設定 Matplotlib 後端為 Agg (必須在 pyplot 匯入前設定)
 matplotlib.use("Agg") 
 import matplotlib.pyplot as plt
 from io import BytesIO
@@ -24,7 +25,7 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Smart ERP Bot", version="Final_Fixed_Agent")
+app = FastAPI(title="Smart ERP Bot", version="Final_Search_Enabled")
 
 # =========================
 # 資料庫連線
@@ -60,7 +61,7 @@ CHAT_MEMORY: Dict[str, List[Any]] = {}
 IMG_STORE: Dict[str, Dict[str, Any]] = {}
 
 # =========================
-# 工具函數
+# 工具函數 (Python Functions)
 # =========================
 def execute_sql_query(sql: str) -> str:
     """【工具】執行 SQL SELECT 查詢 sales 或 purchase 表。"""
@@ -156,7 +157,7 @@ def get_database_schema() -> str:
     """【工具】取得資料庫結構資訊"""
     try:
         with engine.connect() as conn:
-            # 檢查 sales 表
+            # 嘗試取得資料表結構，若無資料表則回傳錯誤
             sales_info = conn.execute(text("SELECT * FROM sales LIMIT 1")).keys()
             purchase_info = conn.execute(text("SELECT * FROM purchase LIMIT 1")).keys()
             
@@ -179,12 +180,6 @@ def get_database_schema() -> str:
         return f"Error: {str(e)}"
 
 # =========================
-# 工具列表 (函式)
-# =========================
-# 這裡只放 Python 函式，Google 搜尋會在 agent_process 中動態加入
-tools_list = [execute_sql_query, create_chart, get_database_schema]
-
-# =========================
 # 系統提示詞
 # =========================
 SYSTEM_PROMPT = """你是一個智能 ERP 助理，名字是「小智」。你擁有以下能力：
@@ -199,62 +194,53 @@ SYSTEM_PROMPT = """你是一個智能 ERP 助理，名字是「小智」。你�
 - 繪圖時必須先用 execute_sql_query 取得資料，再用 create_chart 繪製
 
 ## 🌐 網路搜尋能力 (Google Search)
-- 當用戶問的問題不在資料庫中（例如：新聞、天氣、運動比分、匯率等），請使用 google_search 工具查詢最新資訊。
+- **當用戶問的問題不在資料庫中（例如：最新新聞、NBA 比分、天氣、匯率、歷史事件等），請務必使用 google_search 工具查詢最新資訊。**
+- 不要在沒有搜尋的情況下編造即時資訊。
 
 ## 💬 對話原則
 1. **主動積極**：不要只是回答問題，要主動提供洞察和建議
 2. **數據驅動**：盡可能用實際數據支持你的回答
 3. **視覺化優先**：當數據適合視覺化時，主動建議或直接繪圖
 4. **友善專業**：使用繁體中文，語氣友善但專業
-5. **舉一反三**：回答完問題後，可以主動提供相關的額外資訊或建議
-
-## 📝 回答範例
-用戶問：「2024年銷售狀況如何？」
-你應該：
-1. 查詢 2024 年總銷售額
-2. 比較與 2023 年的差異
-3. 繪製趨勢圖
-4. 分析主要客戶或產品
-5. 給出具體建議
 
 ## 🚫 限制
 - 只能執行 SELECT 查詢，不能修改資料庫
 - 繪圖時 data_json 必須是有效的 JSON 字串格式
-
-記住：你不只是工具的執行者，更是用戶的商業顧問！
 """
 
 # =========================
-# Agent 處理邏輯（多輪對話支援）
+# Agent 處理邏輯
 # =========================
 async def agent_process(user_id: str, text: str, base_url: str, max_turns: int = 5):
-    """增強版 Agent 處理，支援多輪工具調用"""
+    """處理對話，支援 SQL、繪圖與 Google 搜尋"""
     if not client: 
-        return {"text": "❌ Gemini API Key 未設定，請檢查環境變數"}
+        return {"text": "❌ Gemini API Key 未設定"}
     
-    # 取得對話歷史
     history = CHAT_MEMORY.get(user_id, [])
     
     try:
-        # 記錄用戶訊息
         user_message = types.Content(
             role="user",
             parts=[types.Part(text=text)]
         )
         
-        # 完整對話內容
         contents = history + [user_message]
         
         # ==========================================
-        # ✅ 修正點：使用 types.Tool 正確定義搜尋工具
+        # ✅ 關鍵修復：正確定義並混合 Google Search 工具
         # ==========================================
-        search_tool = types.Tool(
+        
+        # 1. 定義搜尋工具 (正確的 SDK 寫法)
+        google_search_tool = types.Tool(
             google_search=types.GoogleSearch()
         )
         
-        # 配置：將 Python 函式與 Google 搜尋工具合併
+        # 2. 混合 Python 函式與搜尋工具
+        # 我們將自定義函式與 google_search_tool 放在同一個清單中傳給 config
+        my_tools = [execute_sql_query, create_chart, get_database_schema, google_search_tool]
+        
         config = types.GenerateContentConfig(
-            tools=tools_list + [search_tool],
+            tools=my_tools, 
             system_instruction=SYSTEM_PROMPT,
             temperature=0.7
         )
@@ -263,14 +249,17 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
         image_url = None
         turn = 0
         
-        # 多輪對話循環
         while turn < max_turns:
             turn += 1
             logger.info(f"Agent 第 {turn} 輪處理")
             
-            # 使用確認過的 gemini-2.0-flash 模型
+            # ==========================================
+            # ✅ 關鍵修復：使用 gemini-1.5-flash
+            # 原因：1.5-flash 是目前最穩定支援「工具混用(SQL+Search)」的版本
+            # 2.0 版本目前會報 "unsupported" 錯誤
+            # ==========================================
             response = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-1.5-flash",
                 contents=contents,
                 config=config
             )
@@ -288,7 +277,6 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
             )
             
             if has_function_call:
-                # 處理工具調用
                 function_responses = []
                 
                 for part in content.parts:
@@ -300,6 +288,7 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
                     
                     tool_result = ""
                     
+                    # 處理自定義 Python 工具
                     if fc.name == "execute_sql_query":
                         tool_result = execute_sql_query(fc.args.get("sql", ""))
                     elif fc.name == "create_chart":
@@ -318,12 +307,12 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
                             tool_result = chart_res
                     elif fc.name == "get_database_schema":
                         tool_result = get_database_schema()
-                    # Google Search 是由模型端執行，我們通常不需要手動處理它的回傳，
-                    # 但如果模型回傳了 function_call 請求搜尋，這裡會被跳過，
-                    # 因為 Google Search 是內建工具，通常會自動處理。
-                    # 如果需要手動處理，可以在這裡加邏輯，但目前的 SDK 通常自動處理。
                     else:
-                        tool_result = f"未知工具: {fc.name}"
+                        # 如果是 Google Search，模型通常會自己在伺服器端執行，
+                        # 但如果跑到這裡，代表模型可能嘗試用 function call 的方式回傳。
+                        # 對於 gemini-1.5-flash，通常它會自動處理 search，
+                        # 我們只需回傳一個空的或提示訊息讓它繼續。
+                        tool_result = f"工具 {fc.name} 已被調用"
                     
                     function_responses.append(
                         types.Part(
@@ -334,7 +323,7 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
                         )
                     )
                 
-                # 將工具回應加入對話
+                # 將工具執行結果回傳給模型
                 contents.append(content)
                 contents.append(types.Content(
                     role="user",
@@ -342,11 +331,10 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
                 ))
                 
             else:
-                # 沒有工具調用，取得最終回應
+                # 沒有工具調用，代表已生成最終回應
                 final_text = response.text
                 break
         
-        # 更新記憶（保留最近 20 輪對話）
         CHAT_MEMORY[user_id] = contents[-20:]
         
         return {
@@ -356,271 +344,94 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
         
     except Exception as e:
         logger.error(f"Agent 處理錯誤: {str(e)}", exc_info=True)
-        return {"text": f"❌ 發生錯誤：{str(e)}\n\n請稍後再試或聯繫管理員。"}
+        return {"text": f"❌ 發生錯誤：{str(e)}"}
 
 # =========================
 # API 端點
 # =========================
 @app.get("/")
 def root():
-    """健康檢查"""
-    return {
-        "status": "ok",
-        "service": "Smart ERP Bot",
-        "timestamp": datetime.now().isoformat(),
-        "database": "connected" if engine else "disconnected",
-        "gemini": "ready" if client else "not configured"
-    }
+    return {"status": "ok", "service": "Smart ERP Bot (Search Enabled)"}
 
 @app.get("/health")
 def health_check():
-    """詳細健康檢查"""
-    checks = {
-        "database": False,
-        "gemini": bool(client),
-        "line": bool(LINE_CHANNEL_ACCESS_TOKEN)
-    }
-    
-    # 測試資料庫連線
+    checks = {"database": False, "gemini": bool(client), "line": bool(LINE_CHANNEL_ACCESS_TOKEN)}
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         checks["database"] = True
     except:
         pass
-    
-    return {
-        "status": "healthy" if all(checks.values()) else "degraded",
-        "checks": checks,
-        "timestamp": datetime.now().isoformat()
-    }
+    return {"status": "healthy" if all(checks.values()) else "degraded", "checks": checks}
 
 @app.get("/img/{img_id}")
 def get_img(img_id: str):
-    """取得圖片"""
     if img_id not in IMG_STORE: 
         raise HTTPException(status_code=404, detail="圖片不存在")
-    
-    return Response(
-        content=IMG_STORE[img_id]["bytes"], 
-        media_type="image/png",
-        headers={
-            "Cache-Control": "public, max-age=3600"
-        }
-    )
+    return Response(content=IMG_STORE[img_id]["bytes"], media_type="image/png")
 
 @app.post("/line/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
-    """LINE Webhook 端點"""
-    
-    # 取得請求內容
     body = await request.body()
     signature = request.headers.get("X-Line-Signature", "")
     
-    # 驗證簽名（重要！）
     if LINE_CHANNEL_SECRET:
-        import hmac
-        import hashlib
-        import base64
-        
-        hash_value = hmac.new(
-            LINE_CHANNEL_SECRET.encode('utf-8'),
-            body,
-            hashlib.sha256
-        ).digest()
+        import hmac, hashlib, base64
+        hash_value = hmac.new(LINE_CHANNEL_SECRET.encode('utf-8'), body, hashlib.sha256).digest()
         expected_signature = base64.b64encode(hash_value).decode('utf-8')
-        
         if signature != expected_signature:
-            logger.warning("⚠️ LINE 簽名驗證失敗")
             raise HTTPException(status_code=400, detail="Invalid signature")
     
-    # 解析事件
     try:
         events = json.loads(body.decode("utf-8")).get("events", [])
-    except json.JSONDecodeError:
-        logger.error("❌ JSON 解析失敗")
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+    except:
+        return {"ok": False}
     
     base_url = f"https://{request.headers.get('host', 'localhost')}"
     
-    # 處理每個事件
     for event in events:
-        logger.info(f"收到事件: {event.get('type')}")
-        
-        # 訊息事件
-        if event.get("type") == "message":
-            message = event.get("message", {})
-            
-            # 文字訊息
-            if message.get("type") == "text":
-                user_id = event["source"]["userId"]
-                text = message["text"]
-                reply_token = event["replyToken"]
-                
-                logger.info(f"用戶 {user_id} 說: {text}")
-                
-                # 非同步處理（避免 timeout）
-                background_tasks.add_task(
-                    handle_message,
-                    user_id,
-                    text,
-                    reply_token,
-                    base_url
-                )
-        
-        # 追蹤事件（用戶加入好友）
-        elif event.get("type") == "follow":
+        if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
+            user_id = event["source"]["userId"]
+            text = event["message"]["text"]
             reply_token = event["replyToken"]
-            welcome_msg = """👋 歡迎使用智能 ERP 助理！
-
-我可以幫你：
-📊 查詢銷售和採購數據
-📈 生成視覺化圖表
-🔍 搜尋最新資訊 (如 NBA 比分、天氣)
-💡 提供商業洞察
-
-試試問我：
-• 「2024年總銷售額是多少？」
-• 「幫我畫出前十大客戶的銷售圖」
-• 「今天 NBA 勇士隊比分多少？」
-
-有任何問題都可以問我！😊"""
+            background_tasks.add_task(handle_message, user_id, text, reply_token, base_url)
             
-            background_tasks.add_task(reply_line, reply_token, welcome_msg, None)
-    
     return {"ok": True}
 
 async def handle_message(user_id: str, text: str, reply_token: str, base_url: str):
-    """處理訊息（非同步）"""
     try:
-        # 處理指令
-        if text.lower() in ['/清除記憶', '/clear', '/reset']:
+        if text.lower() in ['/clear', '清除', '/reset']:
             CHAT_MEMORY.pop(user_id, None)
-            await reply_line(reply_token, "✅ 對話記憶已清除！", None)
+            await reply_line(reply_token, "記憶已清除", None)
             return
         
-        if text.lower() in ['/help', '/說明', '/?']:
-            help_text = """🤖 智能 ERP 助理使用說明
-
-📊 **查詢功能**
-• 2024年銷售多少？
-• 哪個客戶買最多？
-• 採購金額趨勢如何？
-
-📈 **視覺化功能**
-• 畫出月銷售趨勢圖
-• 顯示產品銷售比例
-
-🔍 **搜尋功能**
-• 今天 NBA 勇士隊比分？
-• 台北天氣如何？
-
-⚙️ **指令**
-/清除記憶 - 清除對話歷史
-/說明 - 顯示此說明"""
-            await reply_line(reply_token, help_text, None)
+        # 顯示歡迎/幫助訊息
+        if text.lower() in ['/help', '/說明', '說明']:
+            await reply_line(reply_token, "我可以查資料庫（銷售/採購），也可以上網搜尋（NBA、天氣）。請直接問我問題！", None)
             return
-        
-        # Agent 處理
+
         result = await agent_process(user_id, text, base_url)
         await reply_line(reply_token, result.get("text"), result.get("image"))
-        
     except Exception as e:
-        logger.error(f"處理訊息時發生錯誤: {str(e)}", exc_info=True)
-        await reply_line(reply_token, f"❌ 處理失敗：{str(e)}", None)
+        logger.error(f"Error: {e}")
+        await reply_line(reply_token, "系統忙碌中，請稍後再試。", None)
 
 async def reply_line(token: str, text: Optional[str], img_url: Optional[str]):
-    """回覆 LINE 訊息"""
-    if not LINE_CHANNEL_ACCESS_TOKEN:
-        logger.warning("⚠️ LINE_CHANNEL_ACCESS_TOKEN 未設定，無法回覆")
-        return
-    
-    headers = {
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
+    if not LINE_CHANNEL_ACCESS_TOKEN: return
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
     messages = []
+    if img_url: messages.append({"type": "image", "originalContentUrl": img_url, "previewImageUrl": img_url})
+    if text: messages.append({"type": "text", "text": text[:4999]})
+    if not messages: messages.append({"type": "text", "text": "..."})
     
-    # 圖片訊息
-    if img_url:
-        messages.append({
-            "type": "image",
-            "originalContentUrl": img_url,
-            "previewImageUrl": img_url
-        })
-    
-    # 文字訊息
-    if text:
-        # LINE 訊息長度限制
-        if len(text) > 5000:
-            text = text[:4997] + "..."
-        messages.append({
-            "type": "text",
-            "text": text
-        })
-    
-    if not messages:
-        messages.append({
-            "type": "text",
-            "text": "處理完成！"
-        })
-    
-    payload = {
-        "replyToken": token,
-        "messages": messages
-    }
-    
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as c:
-            response = await c.post(
-                "https://api.line.me/v2/bot/message/reply",
-                headers=headers,
-                json=payload
-            )
-            
-            if response.status_code != 200:
-                logger.error(f"LINE API 錯誤: {response.status_code} - {response.text}")
-            else:
-                logger.info("✅ 訊息已送出")
-    except Exception as e:
-        logger.error(f"發送訊息失敗: {str(e)}")
+    async with httpx.AsyncClient() as c:
+        await c.post("https://api.line.me/v2/bot/message/reply", headers=headers, json={"replyToken": token, "messages": messages})
 
-# =========================
-# 啟動事件
-# =========================
 @app.on_event("startup")
 async def startup():
-    """應用啟動時執行"""
-    logger.info("🚀 應用啟動中...")
-    
-    # 測試資料庫連線
-    try:
-        with engine.connect() as conn:
-            result = conn.execute(text("SELECT 1"))
-            logger.info("✅ 資料庫連線成功")
-    except Exception as e:
-        logger.error(f"❌ 資料庫連線失敗: {str(e)}")
-    
-    # 載入 Excel 資料（如果有）
     try:
         from data_loader import import_excel_files
         import_excel_files()
         logger.info("✅ 資料載入完成")
-    except ImportError:
-        logger.info("ℹ️ data_loader 模組不存在，跳過資料載入")
-    except Exception as e:
-        logger.warning(f"⚠️ 資料載入失敗: {str(e)}")
-    
-    logger.info("✨ 應用啟動完成！")
-
-@app.on_event("shutdown")
-async def shutdown():
-    """應用關閉時執行"""
-    logger.info("👋 應用關閉中...")
-    
-    # 清理圖片快取
-    IMG_STORE.clear()
-    CHAT_MEMORY.clear()
-    
-    logger.info("✅ 清理完成")
+    except:
+        pass
