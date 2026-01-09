@@ -247,7 +247,7 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
         
         # 配置
         config = types.GenerateContentConfig(
-            tools=tools_list + [google_search],
+            tools=tools_list,
             system_instruction=SYSTEM_PROMPT,
             temperature=0.7
         )
@@ -262,7 +262,7 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
             logger.info(f"Agent 第 {turn} 輪處理")
             
             response = client.models.generate_content(
-                model="gemini-flash-latest",
+                model="gemini-2.0-flash",
                 contents=contents,
                 config=config
             )
