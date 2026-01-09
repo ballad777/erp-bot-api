@@ -15,11 +15,7 @@ from sqlalchemy import create_engine, text, inspect
 import pandas as pd
 import httpx
 
-import matplotlib
-# 設定 Matplotlib 後端為 Agg (防止伺服器繪圖錯誤)
-matplotlib.use("Agg") 
-import matplotlib.pyplot as plt
-from io import BytesIO
+# ❌ 移除 Matplotlib (不再需要繪圖)
 
 from google import genai
 from google.genai import types
@@ -28,7 +24,7 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Smart ERP Bot", version="Final_Postgres_Compatible")
+app = FastAPI(title="Smart ERP Bot", version="Text_Analysis_Only")
 
 # =========================
 # 資料庫連線
@@ -37,7 +33,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 if not DATABASE_URL:
-    # 本地測試用 SQLite
     DATABASE_URL = "sqlite:///./erp.db"
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -49,7 +44,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# Google Drive Excel 連結 (從環境變數讀取)
+# Google Drive Excel 連結
 SALES_EXCEL_URL = os.getenv("SALES_EXCEL_URL", "")
 PURCHASE_EXCEL_URL = os.getenv("PURCHASE_EXCEL_URL", "")
 
@@ -66,7 +61,7 @@ if GEMINI_API_KEY:
 # 記憶體存儲
 # =========================
 CHAT_MEMORY: Dict[str, List[Any]] = {} 
-IMG_STORE: Dict[str, Dict[str, Any]] = {}
+# 移除 IMG_STORE (不再需要存圖片)
 
 # =========================
 # 📥 Google Drive 下載與資料匯入邏輯
@@ -85,7 +80,7 @@ def get_drive_id(url: str) -> str:
     return ""
 
 def download_file_from_google_drive(id: str, destination: str):
-    """下載 Google Drive 檔案 (支援大檔案確認)"""
+    """下載 Google Drive 檔案"""
     URL = "https://docs.google.com/uc?export=download"
     session = requests.Session()
     
@@ -120,60 +115,40 @@ def import_data_to_db():
     """下載並匯入資料到資料庫"""
     logger.info("🔄 開始執行資料初始化程序...")
     
-    # 1. 下載檔案
     sales_file = "sales_data.xlsx"
     purchase_file = "purchase_data.xlsx"
-    
     has_sales = False
     has_purchase = False
     
-    # 處理銷售檔案
+    # 下載 Sales
     if SALES_EXCEL_URL:
-        file_id = get_drive_id(SALES_EXCEL_URL)
-        if file_id and download_file_from_google_drive(file_id, sales_file):
+        if download_file_from_google_drive(get_drive_id(SALES_EXCEL_URL), sales_file):
             has_sales = True
-    else:
-        # 如果沒設定 URL，檢查是否有本地檔案
-        if os.path.exists(sales_file): has_sales = True
-        elif glob.glob("sales*.xlsx"): 
-            sales_file = glob.glob("sales*.xlsx")[0]
-            has_sales = True
+    elif os.path.exists(sales_file): has_sales = True
 
-    # 處理採購檔案
+    # 下載 Purchase
     if PURCHASE_EXCEL_URL:
-        file_id = get_drive_id(PURCHASE_EXCEL_URL)
-        if file_id and download_file_from_google_drive(file_id, purchase_file):
+        if download_file_from_google_drive(get_drive_id(PURCHASE_EXCEL_URL), purchase_file):
             has_purchase = True
-    else:
-        if os.path.exists(purchase_file): has_purchase = True
-        elif glob.glob("purchase*.xlsx"): 
-            purchase_file = glob.glob("purchase*.xlsx")[0]
-            has_purchase = True
+    elif os.path.exists(purchase_file): has_purchase = True
             
-    # 2. 讀取並匯入資料庫
     try:
-        # --- 匯入 Sales ---
+        # 處理 Sales
         if has_sales:
             logger.info(f"正在讀取銷售 Excel: {sales_file}")
-            # 讀取所有 sheet
             xls = pd.read_excel(sales_file, sheet_name=None)
             all_sales = []
-            
             for sheet_name, df in xls.items():
-                logger.info(f"  - 處理分頁: {sheet_name}")
-                # 清洗欄位名稱 (移除空格)
-                df.columns = df.columns.str.strip()
-                
-                # 檢查必要欄位
+                df.columns = df.columns.str.strip() # 去除欄位空白
+                # 檢查關鍵欄位
                 if '日期(轉換)' in df.columns and '進銷明細未稅金額' in df.columns:
                     clean_df = pd.DataFrame({
                         'date': pd.to_datetime(df['日期(轉換)'], errors='coerce'),
                         'customer': df['客戶供應商簡稱'],
-                        'product': df['品名'], # 銷售檔通常叫 '品名'
+                        'product': df['品名'],
                         'quantity': pd.to_numeric(df['數量'], errors='coerce').fillna(0),
                         'amount': pd.to_numeric(df['進銷明細未稅金額'], errors='coerce').fillna(0)
                     })
-                    # 移除日期無效的資料
                     clean_df = clean_df.dropna(subset=['date'])
                     clean_df['year'] = clean_df['date'].dt.year
                     clean_df['date'] = clean_df['date'].dt.strftime('%Y-%m-%d')
@@ -183,25 +158,16 @@ def import_data_to_db():
                 final_sales = pd.concat(all_sales, ignore_index=True)
                 final_sales.to_sql('sales', engine, if_exists='replace', index=False)
                 logger.info(f"✅ Sales 資料匯入完成，共 {len(final_sales)} 筆")
-            else:
-                logger.warning("⚠️ Sales Excel 中找不到符合格式的分頁")
-        else:
-            logger.warning("⚠️ 無法找到或下載 Sales 檔案")
 
-        # --- 匯入 Purchase ---
+        # 處理 Purchase
         if has_purchase:
             logger.info(f"正在讀取採購 Excel: {purchase_file}")
             xls = pd.read_excel(purchase_file, sheet_name=None)
             all_purchase = []
-            
             for sheet_name, df in xls.items():
-                logger.info(f"  - 處理分頁: {sheet_name}")
                 df.columns = df.columns.str.strip()
-                
                 if '日期(轉換)' in df.columns and '進銷明細未稅金額' in df.columns:
-                    # 採購檔的品名欄位可能不同，嘗試找 '對方品名/品名備註'
                     prod_col = '對方品名/品名備註' if '對方品名/品名備註' in df.columns else '品名'
-                    
                     clean_df = pd.DataFrame({
                         'date': pd.to_datetime(df['日期(轉換)'], errors='coerce'),
                         'supplier': df['客戶供應商簡稱'],
@@ -218,10 +184,6 @@ def import_data_to_db():
                 final_purchase = pd.concat(all_purchase, ignore_index=True)
                 final_purchase.to_sql('purchase', engine, if_exists='replace', index=False)
                 logger.info(f"✅ Purchase 資料匯入完成，共 {len(final_purchase)} 筆")
-            else:
-                logger.warning("⚠️ Purchase Excel 中找不到符合格式的分頁")
-        else:
-            logger.warning("⚠️ 無法找到或下載 Purchase 檔案")
 
     except Exception as e:
         logger.error(f"❌ 資料匯入嚴重錯誤: {str(e)}")
@@ -232,135 +194,86 @@ def import_data_to_db():
 def execute_sql_query(sql: str) -> str:
     """【工具】執行 SQL SELECT 查詢 sales 或 purchase 表。"""
     logger.info(f"執行 SQL: {sql}")
-    
-    # 清洗 SQL
     sql = sql.replace("```sql", "").replace("```", "").strip()
-    sql_lower = sql.lower()
-    if not sql_lower.startswith("select"):
-        return "錯誤：只允許 SELECT 查詢。"
     
-    # 檢查是否嘗試修改資料
-    if any(k in sql_lower for k in ['drop', 'delete', 'update', 'insert', 'alter']):
+    if not sql.lower().startswith("select"): return "錯誤：只允許 SELECT 查詢。"
+    if any(k in sql.lower() for k in ['drop', 'delete', 'update', 'insert', 'alter']):
         return "錯誤：禁止修改資料庫。"
     
     try:
-        # ==========================================
-        # ✅ 修正點：使用 SQLAlchemy inspect 檢查表是否存在
-        # 這能同時相容 SQLite 和 PostgreSQL
-        # ==========================================
         insp = inspect(engine)
         table_names = insp.get_table_names()
         
-        # 如果 SQL 裡提到的表不存在，回傳友善錯誤
-        if 'sales' in sql_lower and 'sales' not in table_names:
+        if 'sales' in sql.lower() and 'sales' not in table_names:
             return "系統錯誤：銷售資料表 (sales) 尚未建立，請確認資料是否已匯入。"
-        if 'purchase' in sql_lower and 'purchase' not in table_names:
+        if 'purchase' in sql.lower() and 'purchase' not in table_names:
             return "系統錯誤：採購資料表 (purchase) 尚未建立。"
 
         with engine.connect() as conn:
             df = pd.read_sql(text(sql), conn)
+            if df.empty: return "查無資料。"
             
-            if df.empty: 
-                return "查詢成功但沒有找到資料。請嘗試放寬條件或確認關鍵字。"
-            
-            # 轉字串避免 JSON 錯誤
             for col in df.select_dtypes(include=['datetime64']).columns:
                 df[col] = df[col].astype(str)
             
-            if len(df) > 100:
-                logger.info(f"結果過多 ({len(df)})，僅回傳前 100 筆")
-                df = df.head(100)
+            # 限制回傳筆數，避免 JSON 過大
+            if len(df) > 50:
+                logger.info(f"結果過多 ({len(df)})，僅回傳前 50 筆")
+                df = df.head(50)
                 
             return df.to_json(orient="records", force_ascii=False, date_format='iso')
     except Exception as e:
-        logger.error(f"SQL 執行錯誤: {str(e)}")
         return f"SQL Error: {str(e)}"
-
-def create_chart(title: str, chart_type: str, data_json: str, x_key: str, y_key: str) -> str:
-    """【工具】繪製圖表 (bar/line/pie)。"""
-    logger.info(f"繪製圖表: {title}")
-    try:
-        data = json.loads(data_json)
-        df = pd.DataFrame(data)
-        if df.empty: return "無資料繪圖"
-        
-        if x_key not in df.columns or y_key not in df.columns:
-            return f"欄位錯誤: {x_key} 或 {y_key} 不存在"
-        
-        df[y_key] = pd.to_numeric(df[y_key], errors='coerce').fillna(0)
-        
-        plt.figure(figsize=(10, 6))
-        plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'Arial Unicode MS', 'sans-serif']
-        plt.rcParams['axes.unicode_minus'] = False
-        
-        if chart_type == "line": plt.plot(df[x_key], df[y_key], marker='o')
-        elif chart_type == "bar": plt.bar(df[x_key], df[y_key], color='steelblue')
-        elif chart_type == "pie":
-            df_s = df.sort_values(by=y_key, ascending=False).head(8)
-            plt.pie(df_s[y_key], labels=df_s[x_key], autopct='%1.1f%%')
-            
-        plt.title(title, fontsize=14)
-        plt.tight_layout()
-        
-        buf = BytesIO()
-        plt.savefig(buf, format="png", dpi=100)
-        plt.close()
-        
-        img_id = str(uuid.uuid4())
-        IMG_STORE[img_id] = {"bytes": buf.getvalue(), "ts": time.time()}
-        return f"IMAGE_ID:{img_id}"
-    except Exception as e:
-        return f"Chart Error: {str(e)}"
 
 def get_database_schema() -> str:
     """【工具】取得資料表結構"""
     try:
-        # ==========================================
-        # ✅ 修正點：使用 SQLAlchemy inspect 取得 Schema
-        # ==========================================
         insp = inspect(engine)
         table_names = insp.get_table_names()
-        
         summary = {}
         with engine.connect() as conn:
             for t_name in table_names:
-                # 只關心 sales 和 purchase
-                if t_name not in ['sales', 'purchase']:
-                    continue
-                    
-                # 取得第一列來當作範例
+                if t_name not in ['sales', 'purchase']: continue
                 cols = conn.execute(text(f"SELECT * FROM {t_name} LIMIT 1")).keys()
                 count = conn.execute(text(f"SELECT COUNT(*) FROM {t_name}")).scalar()
                 summary[t_name] = {'columns': list(cols), 'count': count}
-                
         return json.dumps(summary, ensure_ascii=False)
     except Exception as e:
         return f"Error: {str(e)}"
 
-# =========================
-# 工具列表
-# =========================
-tools_list = [execute_sql_query, create_chart, get_database_schema]
+# ❌ 移除 create_chart 工具
+tools_list = [execute_sql_query, get_database_schema]
 
 # =========================
-# 系統提示詞
+# 系統提示詞 (極簡風格調教)
 # =========================
-SYSTEM_PROMPT = """你是一個專業的 ERP 數據助理。
+SYSTEM_PROMPT = """你是一個專業、俐落的 ERP 商業分析師。
 請根據資料庫中的 `sales` (銷售) 與 `purchase` (採購) 資料表回答問題。
 
-## 重要指令
-1. **直接回答**：不要自我介紹，不要說「我是小智」，直接針對問題提供數據或圖表。
-2. **模糊搜尋**：用戶輸入的關鍵字可能會有錯字，請使用 `LIKE` 進行模糊比對。
-   - 例如：用戶查 "ipone" -> SQL 用 `product LIKE '%iPhone%'`
-   - 例如：用戶查 "華碩" -> SQL 用 `customer LIKE '%華碩%'`
-3. **資料表結構**：
-   - sales: date, customer, product, quantity, amount, year
-   - purchase: date, supplier, product, quantity, amount, year
+## ⚠️ 回答風格規範 (Violations will be punished)
+1. **嚴禁使用 Markdown 格式**：
+   - 絕對不要使用米字號 `*` 或 `**`。
+   - 絕對不要使用井字號 `#` 做標題。
+   - 請使用純文字，用換行或連字號 `-` 來條列重點。
+   
+2. **專注文字分析**：
+   - 用戶**不需要圖表**。
+   - 請消化數據後，用文字提供「洞察 (Insights)」。
+   - 例如：不要只列出數字，要告訴用戶「跟去年比成長了多少」或「哪個客戶佔比最高」。
 
-## SQL 規則
-- 查詢總額使用 `SUM(amount)`
-- 查詢銷量使用 `SUM(quantity)`
-- 若查無資料，請嘗試放寬條件 (例如移除年份限制或簡化關鍵字)
+3. **回答精簡扼要**：
+   - 除非用戶要求「詳細清單」，否則預設只給總結數據。
+   - 不要把 JSON 資料直接貼出來。
+
+4. **專注當下**：
+   - 只回答用戶最新一次輸入的問題，忽略無關的歷史對話。
+
+5. **模糊搜尋**：
+   - 用戶打錯字或打簡稱（如 "ipone", "華碩"），請自動用 `LIKE` 修正查詢。
+
+## 資料表結構
+- `sales` (銷售): date, customer, product, quantity, amount, year
+- `purchase` (採購): date, supplier, product, quantity, amount, year
 """
 
 # =========================
@@ -369,32 +282,30 @@ SYSTEM_PROMPT = """你是一個專業的 ERP 數據助理。
 async def agent_process(user_id: str, text: str, base_url: str):
     if not client: return {"text": "API Key 未設定"}
     
-    history = CHAT_MEMORY.get(user_id, [])
+    # 只取最近 2 輪對話，保持對話乾淨
+    history = CHAT_MEMORY.get(user_id, [])[-2:] 
+    
     user_message = types.Content(role="user", parts=[types.Part(text=text)])
     contents = history + [user_message]
     
     config = types.GenerateContentConfig(
         tools=tools_list,
         system_instruction=SYSTEM_PROMPT,
-        temperature=0.3
+        temperature=0.2 # 低溫，讓回答更收斂
     )
     
     final_text = "抱歉，無法處理。"
-    image_url = None
     
     try:
-        # 使用 gemini-flash-latest (對應 1.5 Flash)
         response = client.models.generate_content(
             model="gemini-flash-latest",
             contents=contents,
             config=config
         )
         
-        # 處理 Function Call
         if response.candidates:
             candidate = response.candidates[0]
-            # 迴圈處理工具呼叫 (支援多輪)
-            for _ in range(5): # 最多 5 輪
+            for _ in range(5): 
                 has_tool = False
                 for part in candidate.content.parts:
                     if part.function_call:
@@ -405,23 +316,9 @@ async def agent_process(user_id: str, text: str, base_url: str):
                         res = ""
                         if fc.name == "execute_sql_query":
                             res = execute_sql_query(fc.args.get("sql", ""))
-                        elif fc.name == "create_chart":
-                            chart_res = create_chart(
-                                fc.args.get("title", ""),
-                                fc.args.get("chart_type", "bar"),
-                                fc.args.get("data_json", "[]"),
-                                fc.args.get("x_key", ""),
-                                fc.args.get("y_key", "")
-                            )
-                            if "IMAGE_ID" in chart_res:
-                                img_id = chart_res.split(":")[1]
-                                image_url = f"{base_url}/img/{img_id}"
-                                res = "圖表已生成"
-                            else: res = chart_res
                         elif fc.name == "get_database_schema":
                             res = get_database_schema()
                         
-                        # 回傳工具結果
                         contents.append(candidate.content)
                         contents.append(types.Content(
                             role="user",
@@ -433,21 +330,25 @@ async def agent_process(user_id: str, text: str, base_url: str):
                             )]
                         ))
                         
-                        # 再次呼叫模型取得文字回應
                         response = client.models.generate_content(
                             model="gemini-flash-latest",
                             contents=contents,
                             config=config
                         )
                         candidate = response.candidates[0]
-                        break # 跳出 parts 迴圈，處理新的 response
+                        break 
                 
                 if not has_tool:
                     final_text = response.text
                     break
 
-        CHAT_MEMORY[user_id] = contents[-20:]
-        return {"text": final_text, "image": image_url}
+        # 更新記憶
+        CHAT_MEMORY[user_id] = contents[-4:]
+        
+        # 再次過濾米字號 (雙重保險)
+        final_text = final_text.replace("*", "").replace("#", "")
+        
+        return {"text": final_text, "image": None}
         
     except Exception as e:
         logger.error(f"Agent Error: {e}")
@@ -458,23 +359,17 @@ async def agent_process(user_id: str, text: str, base_url: str):
 # =========================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "ERP Bot"}
+    return {"status": "ok", "service": "ERP Bot (Text Only)"}
 
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
-
-@app.get("/img/{img_id}")
-def get_img(img_id: str):
-    if img_id not in IMG_STORE: raise HTTPException(404, "Not Found")
-    return Response(content=IMG_STORE[img_id]["bytes"], media_type="image/png")
 
 @app.post("/line/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
     signature = request.headers.get("X-Line-Signature", "")
     
-    # 驗證簽名 (若有設定 SECRET)
     if LINE_CHANNEL_SECRET:
         import hmac, hashlib, base64
         hash_val = hmac.new(LINE_CHANNEL_SECRET.encode('utf-8'), body, hashlib.sha256).digest()
@@ -504,7 +399,7 @@ async def handle_message(user_id: str, text: str, reply_token: str, base_url: st
             return
 
         result = await agent_process(user_id, text, base_url)
-        await reply_line(reply_token, result.get("text"), result.get("image"))
+        await reply_line(reply_token, result.get("text"), None)
     except Exception as e:
         logger.error(f"Handle Error: {e}")
         await reply_line(reply_token, "系統忙碌中", None)
@@ -513,7 +408,7 @@ async def reply_line(token: str, text: Optional[str], img_url: Optional[str]):
     if not LINE_CHANNEL_ACCESS_TOKEN: return
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
     messages = []
-    if img_url: messages.append({"type": "image", "originalContentUrl": img_url, "previewImageUrl": img_url})
+    # 這裡已經不需要 img_url 了，但為了相容性保留參數
     if text: messages.append({"type": "text", "text": text[:4999]})
     if not messages: messages.append({"type": "text", "text": "..."})
     
