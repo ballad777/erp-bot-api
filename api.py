@@ -20,6 +20,21 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 app = FastAPI(title="ERP Bot API", version="2.0")
 
+from sqlalchemy import text
+
+@app.get("/_debug/schema")
+def debug_schema():
+    sql = text("""
+        SELECT table_name, column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name IN ('sales','purchase')
+        ORDER BY table_name, ordinal_position;
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(sql).mappings().all()
+    return {"ok": True, "columns": [dict(r) for r in rows]}
+
 # =========================
 # LINE ENV
 # =========================
@@ -444,16 +459,3 @@ async def line_webhook(request: Request):
             await line_reply(reply_token, answer)
         except Exception as e:
             print("LINE reply exception:", repr(e))
-
-    return {"status": "ok"}
-@app.get("/_debug/schema")
-def debug_schema():
-    sql = """
-    SELECT table_name, column_name, data_type
-    FROM information_schema.columns
-    WHERE table_name IN ('sales','purchase')
-    ORDER BY table_name, ordinal_position;
-    """
-    with engine.connect() as conn:
-        rows = conn.execute(text(sql)).mappings().all()
-    return rows
