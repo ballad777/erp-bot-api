@@ -1,424 +1,828 @@
 import os
 import re
-import time
-import uuid
 import json
+import time
+import hmac
+import base64
+import hashlib
 import logging
-import glob
-import requests
-from typing import Dict, List, Any, Optional
-from datetime import datetime
+import urllib.parse
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from fastapi.responses import Response, JSONResponse
-from sqlalchemy import create_engine, text, inspect
+import requests
 import pandas as pd
 import httpx
 
-# ❌ 移除 Matplotlib (不再需要繪圖)
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
 
+from sqlalchemy import create_engine, text, inspect
+from sqlalchemy.engine import Engine
+
+# Gemini SDK
 from google import genai
 from google.genai import types
 
-# 設定日誌
+# =========================
+# Logging
+# =========================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("erpbot_pro")
 
-app = FastAPI(title="Smart ERP Bot", version="Text_Analysis_Only")
+app = FastAPI(title="ERP Bot Pro", version="Commercial_Pro")
 
 # =========================
-# 資料庫連線
+# Settings
 # =========================
-DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./erp.db")
+if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-if not DATABASE_URL:
-    DATABASE_URL = "sqlite:///./erp.db"
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-
-# =========================
-# LINE & Gemini 設定
-# =========================
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 
-# Google Drive Excel 連結
-SALES_EXCEL_URL = os.getenv("SALES_EXCEL_URL", "")
-PURCHASE_EXCEL_URL = os.getenv("PURCHASE_EXCEL_URL", "")
+SALES_SHEET_URL = os.getenv("SALES_EXCEL_URL", "")
+PURCHASE_SHEET_URL = os.getenv("PURCHASE_EXCEL_URL", "")
 
-if not LINE_CHANNEL_ACCESS_TOKEN:
-    logger.warning("⚠️ LINE_CHANNEL_ACCESS_TOKEN 未設定")
-if not GEMINI_API_KEY:
-    logger.warning("⚠️ GEMINI_API_KEY 未設定")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # required to call /admin/*
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "40"))
 
-client = None
-if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
+# Render free: avoid startup import. Use GitHub Actions daily trigger instead.
+AUTO_IMPORT_ON_STARTUP = os.getenv("AUTO_IMPORT_ON_STARTUP", "0") == "1"
 
-# =========================
-# 記憶體存儲
-# =========================
-CHAT_MEMORY: Dict[str, List[Any]] = {} 
-# 移除 IMG_STORE (不再需要存圖片)
+engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+# In-memory rate store (good enough; for multi-instance use Redis)
+RATE_STORE: Dict[str, List[float]] = {}
 
 # =========================
-# 📥 Google Drive 下載與資料匯入邏輯
+# Utilities
 # =========================
+def now_taipei() -> datetime:
+    # Simple fixed offset; good enough for this use-case
+    return datetime.utcnow() + timedelta(hours=8)
+
+def rate_limit_ok(user_id: str) -> bool:
+    now = time.time()
+    window_start = now - 60
+    ts = RATE_STORE.get(user_id, [])
+    ts = [t for t in ts if t >= window_start]
+    if len(ts) >= RATE_LIMIT_PER_MIN:
+        RATE_STORE[user_id] = ts
+        return False
+    ts.append(now)
+    RATE_STORE[user_id] = ts
+    return True
+
+def require_admin(request: Request):
+    if not ADMIN_TOKEN:
+        raise HTTPException(500, "ADMIN_TOKEN not set")
+    token = request.headers.get("X-Admin-Token", "")
+    if not hmac.compare_digest(token, ADMIN_TOKEN):
+        raise HTTPException(401, "Unauthorized")
+
 def get_drive_id(url: str) -> str:
-    """從 Google Drive 連結提取 File ID"""
     patterns = [
-        r'/file/d/([a-zA-Z0-9_-]+)',
-        r'id=([a-zA-Z0-9_-]+)',
-        r'/spreadsheets/d/([a-zA-Z0-9_-]+)'
+        r"/spreadsheets/d/([a-zA-Z0-9_-]+)",
+        r"/file/d/([a-zA-Z0-9_-]+)",
+        r"id=([a-zA-Z0-9_-]+)",
     ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
     return ""
 
-def download_file_from_google_drive(id: str, destination: str):
-    """下載 Google Drive 檔案"""
-    URL = "https://docs.google.com/uc?export=download"
-    session = requests.Session()
-    
-    logger.info(f"正在下載檔案 ID: {id} 到 {destination}...")
-    try:
-        response = session.get(URL, params={'id': id}, stream=True)
-        token = None
-        for key, value in response.cookies.items():
-            if key.startswith('download_warning'):
-                token = value
-                break
-        
-        if token:
-            params = {'id': id, 'confirm': token}
-            response = session.get(URL, params=params, stream=True)
-            
-        if response.status_code == 200:
-            with open(destination, "wb") as f:
-                for chunk in response.iter_content(32768):
+def download_google_sheet_xlsx(sheet_url: str, dest_path: str, max_retries: int = 4) -> bool:
+    sheet_id = get_drive_id(sheet_url)
+    if not sheet_id:
+        return False
+    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export"
+    params = {"format": "xlsx"}
+
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(export_url, params=params, stream=True, timeout=60)
+            if r.status_code != 200:
+                logger.error(f"Sheet export failed: {r.status_code}")
+                time.sleep(min(10, 2 ** attempt))
+                continue
+
+            # xlsx is a zip -> "PK"
+            first2 = r.raw.read(2)
+            if first2 != b"PK":
+                logger.error("Not xlsx content (permission page/HTML?)")
+                time.sleep(min(10, 2 ** attempt))
+                continue
+
+            with open(dest_path, "wb") as f:
+                f.write(first2)
+                for chunk in r.iter_content(32768):
                     if chunk:
                         f.write(chunk)
-            logger.info(f"✅ 下載成功: {destination}")
             return True
+        except Exception as e:
+            logger.error(f"download error attempt {attempt+1}: {e}")
+            time.sleep(min(10, 2 ** attempt))
+    return False
+
+# =========================
+# DB schema & migrations
+# =========================
+def ensure_tables():
+    with engine.begin() as conn:
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS sales (
+            date TEXT,
+            customer TEXT,
+            product TEXT,
+            quantity REAL,
+            amount REAL,
+            year INTEGER
+        );
+        """))
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS purchase (
+            date TEXT,
+            supplier TEXT,
+            product TEXT,
+            quantity REAL,
+            amount REAL,
+            year INTEGER
+        );
+        """))
+
+        # de-dup unique index
+        # SQLite supports it; Postgres supports it
+        conn.execute(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_sales_row
+        ON sales(date, customer, product, amount, quantity);
+        """))
+        conn.execute(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_purchase_row
+        ON purchase(date, supplier, product, amount, quantity);
+        """))
+
+def table_counts() -> Dict[str, int]:
+    insp = inspect(engine)
+    names = insp.get_table_names()
+    out = {"sales": 0, "purchase": 0}
+    with engine.connect() as conn:
+        for t in ["sales", "purchase"]:
+            if t in names:
+                out[t] = int(conn.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar() or 0)
+    return out
+
+# =========================
+# Import pipeline (Google Sheet -> DB)
+# =========================
+def normalize_sales_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    df.columns = df.columns.astype(str).str.strip()
+    need = {"日期(轉換)", "進銷明細未稅金額"}
+    if not need.issubset(set(df.columns)):
+        return None
+
+    clean = pd.DataFrame({
+        "date": pd.to_datetime(df["日期(轉換)"], errors="coerce"),
+        "customer": df.get("客戶供應商簡稱", "").astype(str),
+        "product": df.get("品名", "").astype(str),
+        "quantity": pd.to_numeric(df.get("數量", 0), errors="coerce").fillna(0),
+        "amount": pd.to_numeric(df["進銷明細未稅金額"], errors="coerce").fillna(0),
+    }).dropna(subset=["date"])
+
+    clean["customer"] = clean["customer"].str.strip()
+    clean["product"] = clean["product"].str.strip()
+    clean["year"] = clean["date"].dt.year
+    clean["date"] = clean["date"].dt.strftime("%Y-%m-%d")
+    return clean
+
+def normalize_purchase_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    df.columns = df.columns.astype(str).str.strip()
+    need = {"日期(轉換)", "進銷明細未稅金額"}
+    if not need.issubset(set(df.columns)):
+        return None
+
+    prod_col = "對方品名/品名備註" if "對方品名/品名備註" in df.columns else "品名"
+    clean = pd.DataFrame({
+        "date": pd.to_datetime(df["日期(轉換)"], errors="coerce"),
+        "supplier": df.get("客戶供應商簡稱", "").astype(str),
+        "product": df.get(prod_col, "").astype(str),
+        "quantity": pd.to_numeric(df.get("數量", 0), errors="coerce").fillna(0),
+        "amount": pd.to_numeric(df["進銷明細未稅金額"], errors="coerce").fillna(0),
+    }).dropna(subset=["date"])
+
+    clean["supplier"] = clean["supplier"].str.strip()
+    clean["product"] = clean["product"].str.strip()
+    clean["year"] = clean["date"].dt.year
+    clean["date"] = clean["date"].dt.strftime("%Y-%m-%d")
+    return clean
+
+def upsert_rows(kind: str, rows: List[Dict[str, Any]]) -> int:
+    dialect = engine.url.get_backend_name()
+    inserted_attempted = 0
+
+    with engine.begin() as conn:
+        if kind == "sales":
+            if dialect == "postgresql":
+                stmt = text("""
+                INSERT INTO sales(date, customer, product, quantity, amount, year)
+                VALUES (:date, :customer, :product, :quantity, :amount, :year)
+                ON CONFLICT (date, customer, product, amount, quantity) DO NOTHING;
+                """)
+            else:
+                stmt = text("""
+                INSERT OR IGNORE INTO sales(date, customer, product, quantity, amount, year)
+                VALUES (:date, :customer, :product, :quantity, :amount, :year);
+                """)
         else:
-            logger.error(f"❌ 下載失敗，狀態碼: {response.status_code}")
-            return False
-    except Exception as e:
-        logger.error(f"❌ 下載發生錯誤: {str(e)}")
-        return False
+            if dialect == "postgresql":
+                stmt = text("""
+                INSERT INTO purchase(date, supplier, product, quantity, amount, year)
+                VALUES (:date, :supplier, :product, :quantity, :amount, :year)
+                ON CONFLICT (date, supplier, product, amount, quantity) DO NOTHING;
+                """)
+            else:
+                stmt = text("""
+                INSERT OR IGNORE INTO purchase(date, supplier, product, quantity, amount, year)
+                VALUES (:date, :supplier, :product, :quantity, :amount, :year);
+                """)
 
-def import_data_to_db():
-    """下載並匯入資料到資料庫"""
-    logger.info("🔄 開始執行資料初始化程序...")
-    
-    sales_file = "sales_data.xlsx"
-    purchase_file = "purchase_data.xlsx"
-    has_sales = False
-    has_purchase = False
-    
-    # 下載 Sales
-    if SALES_EXCEL_URL:
-        if download_file_from_google_drive(get_drive_id(SALES_EXCEL_URL), sales_file):
-            has_sales = True
-    elif os.path.exists(sales_file): has_sales = True
+        for r in rows:
+            conn.execute(stmt, r)
+            inserted_attempted += 1
 
-    # 下載 Purchase
-    if PURCHASE_EXCEL_URL:
-        if download_file_from_google_drive(get_drive_id(PURCHASE_EXCEL_URL), purchase_file):
-            has_purchase = True
-    elif os.path.exists(purchase_file): has_purchase = True
-            
-    try:
-        # 處理 Sales
-        if has_sales:
-            logger.info(f"正在讀取銷售 Excel: {sales_file}")
-            xls = pd.read_excel(sales_file, sheet_name=None)
-            all_sales = []
-            for sheet_name, df in xls.items():
-                df.columns = df.columns.str.strip() # 去除欄位空白
-                # 檢查關鍵欄位
-                if '日期(轉換)' in df.columns and '進銷明細未稅金額' in df.columns:
-                    clean_df = pd.DataFrame({
-                        'date': pd.to_datetime(df['日期(轉換)'], errors='coerce'),
-                        'customer': df['客戶供應商簡稱'],
-                        'product': df['品名'],
-                        'quantity': pd.to_numeric(df['數量'], errors='coerce').fillna(0),
-                        'amount': pd.to_numeric(df['進銷明細未稅金額'], errors='coerce').fillna(0)
-                    })
-                    clean_df = clean_df.dropna(subset=['date'])
-                    clean_df['year'] = clean_df['date'].dt.year
-                    clean_df['date'] = clean_df['date'].dt.strftime('%Y-%m-%d')
-                    all_sales.append(clean_df)
-            
-            if all_sales:
-                final_sales = pd.concat(all_sales, ignore_index=True)
-                final_sales.to_sql('sales', engine, if_exists='replace', index=False)
-                logger.info(f"✅ Sales 資料匯入完成，共 {len(final_sales)} 筆")
+    return inserted_attempted
 
-        # 處理 Purchase
-        if has_purchase:
-            logger.info(f"正在讀取採購 Excel: {purchase_file}")
-            xls = pd.read_excel(purchase_file, sheet_name=None)
-            all_purchase = []
-            for sheet_name, df in xls.items():
-                df.columns = df.columns.str.strip()
-                if '日期(轉換)' in df.columns and '進銷明細未稅金額' in df.columns:
-                    prod_col = '對方品名/品名備註' if '對方品名/品名備註' in df.columns else '品名'
-                    clean_df = pd.DataFrame({
-                        'date': pd.to_datetime(df['日期(轉換)'], errors='coerce'),
-                        'supplier': df['客戶供應商簡稱'],
-                        'product': df[prod_col],
-                        'quantity': pd.to_numeric(df['數量'], errors='coerce').fillna(0),
-                        'amount': pd.to_numeric(df['進銷明細未稅金額'], errors='coerce').fillna(0)
-                    })
-                    clean_df = clean_df.dropna(subset=['date'])
-                    clean_df['year'] = clean_df['date'].dt.year
-                    clean_df['date'] = clean_df['date'].dt.strftime('%Y-%m-%d')
-                    all_purchase.append(clean_df)
-            
-            if all_purchase:
-                final_purchase = pd.concat(all_purchase, ignore_index=True)
-                final_purchase.to_sql('purchase', engine, if_exists='replace', index=False)
-                logger.info(f"✅ Purchase 資料匯入完成，共 {len(final_purchase)} 筆")
+def import_from_sheets() -> Dict[str, Any]:
+    ensure_tables()
 
-    except Exception as e:
-        logger.error(f"❌ 資料匯入嚴重錯誤: {str(e)}")
+    report = {"ok": True, "counts_before": table_counts(), "messages": [], "counts_after": None}
+
+    tmp_sales = f"./_sales_{int(time.time())}.xlsx"
+    tmp_purchase = f"./_purchase_{int(time.time())}.xlsx"
+
+    # Sales
+    if SALES_SHEET_URL:
+        ok = download_google_sheet_xlsx(SALES_SHEET_URL, tmp_sales)
+        if not ok:
+            report["messages"].append("sales: 下載失敗（請確認連結權限/格式）")
+        else:
+            xls = pd.read_excel(tmp_sales, sheet_name=None)
+            dfs = []
+            for _, df in xls.items():
+                n = normalize_sales_df(df)
+                if n is not None and len(n) > 0:
+                    dfs.append(n)
+            if dfs:
+                final = pd.concat(dfs, ignore_index=True)
+                upsert_rows("sales", final.to_dict(orient="records"))
+                report["messages"].append(f"sales: 讀到 {len(final)} 筆，已嘗試匯入")
+            else:
+                report["messages"].append("sales: 沒找到符合欄位的分頁")
+    else:
+        report["messages"].append("sales: 未設定 SALES_EXCEL_URL")
+
+    # Purchase
+    if PURCHASE_SHEET_URL:
+        ok = download_google_sheet_xlsx(PURCHASE_SHEET_URL, tmp_purchase)
+        if not ok:
+            report["messages"].append("purchase: 下載失敗（請確認連結權限/格式）")
+        else:
+            xls = pd.read_excel(tmp_purchase, sheet_name=None)
+            dfs = []
+            for _, df in xls.items():
+                n = normalize_purchase_df(df)
+                if n is not None and len(n) > 0:
+                    dfs.append(n)
+            if dfs:
+                final = pd.concat(dfs, ignore_index=True)
+                upsert_rows("purchase", final.to_dict(orient="records"))
+                report["messages"].append(f"purchase: 讀到 {len(final)} 筆，已嘗試匯入")
+            else:
+                report["messages"].append("purchase: 沒找到符合欄位的分頁")
+    else:
+        report["messages"].append("purchase: 未設定 PURCHASE_EXCEL_URL")
+
+    # cleanup
+    for p in [tmp_sales, tmp_purchase]:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except:
+            pass
+
+    report["counts_after"] = table_counts()
+    report["ok"] = True
+    return report
 
 # =========================
-# 工具函數
+# Chart URL (QuickChart) - no file storage
 # =========================
-def execute_sql_query(sql: str) -> str:
-    """【工具】執行 SQL SELECT 查詢 sales 或 purchase 表。"""
-    logger.info(f"執行 SQL: {sql}")
-    sql = sql.replace("```sql", "").replace("```", "").strip()
-    
-    if not sql.lower().startswith("select"): return "錯誤：只允許 SELECT 查詢。"
-    if any(k in sql.lower() for k in ['drop', 'delete', 'update', 'insert', 'alter']):
-        return "錯誤：禁止修改資料庫。"
-    
-    try:
-        insp = inspect(engine)
-        table_names = insp.get_table_names()
-        
-        if 'sales' in sql.lower() and 'sales' not in table_names:
-            return "系統錯誤：銷售資料表 (sales) 尚未建立，請確認資料是否已匯入。"
-        if 'purchase' in sql.lower() and 'purchase' not in table_names:
-            return "系統錯誤：採購資料表 (purchase) 尚未建立。"
+def quickchart_url(chart_type: str, title: str, labels: List[str], values: List[float]) -> str:
+    if chart_type not in ["line", "bar", "pie"]:
+        chart_type = "line"
 
-        with engine.connect() as conn:
-            df = pd.read_sql(text(sql), conn)
-            if df.empty: return "查無資料。"
-            
-            for col in df.select_dtypes(include=['datetime64']).columns:
-                df[col] = df[col].astype(str)
-            
-            # 限制回傳筆數，避免 JSON 過大
-            if len(df) > 50:
-                logger.info(f"結果過多 ({len(df)})，僅回傳前 50 筆")
-                df = df.head(50)
-                
-            return df.to_json(orient="records", force_ascii=False, date_format='iso')
-    except Exception as e:
-        return f"SQL Error: {str(e)}"
+    if chart_type == "line":
+        cfg = {
+            "type": "line",
+            "data": {"labels": labels, "datasets": [{"label": title, "data": values}]},
+            "options": {"plugins": {"title": {"display": True, "text": title}},
+                        "scales": {"y": {"beginAtZero": True}}}
+        }
+    elif chart_type == "bar":
+        cfg = {
+            "type": "bar",
+            "data": {"labels": labels, "datasets": [{"label": title, "data": values}]},
+            "options": {"plugins": {"title": {"display": True, "text": title}}}
+        }
+    else:
+        cfg = {
+            "type": "pie",
+            "data": {"labels": labels, "datasets": [{"data": values}]},
+            "options": {"plugins": {"title": {"display": True, "text": title}}}
+        }
 
-def get_database_schema() -> str:
-    """【工具】取得資料表結構"""
-    try:
-        insp = inspect(engine)
-        table_names = insp.get_table_names()
-        summary = {}
-        with engine.connect() as conn:
-            for t_name in table_names:
-                if t_name not in ['sales', 'purchase']: continue
-                cols = conn.execute(text(f"SELECT * FROM {t_name} LIMIT 1")).keys()
-                count = conn.execute(text(f"SELECT COUNT(*) FROM {t_name}")).scalar()
-                summary[t_name] = {'columns': list(cols), 'count': count}
-        return json.dumps(summary, ensure_ascii=False)
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-# ❌ 移除 create_chart 工具
-tools_list = [execute_sql_query, get_database_schema]
+    c = json.dumps(cfg, ensure_ascii=False)
+    return "https://quickchart.io/chart?c=" + urllib.parse.quote(c)
 
 # =========================
-# 系統提示詞 (極簡風格調教)
+# “頂級商用”核心：LLM 只做意圖解析 (JSON)，SQL 由後端模板生成
 # =========================
-SYSTEM_PROMPT = """你是一個專業、俐落的 ERP 商業分析師。
-請根據資料庫中的 `sales` (銷售) 與 `purchase` (採購) 資料表回答問題。
+INTENT_SYSTEM = """你是一個 ERP 問題解析器。你只能輸出 JSON（不要任何多餘文字）。
+目標：把使用者問題轉成後端可執行的查詢計畫。
 
-## ⚠️ 回答風格規範 (Violations will be punished)
-1. **嚴禁使用 Markdown 格式**：
-   - 絕對不要使用米字號 `*` 或 `**`。
-   - 絕對不要使用井字號 `#` 做標題。
-   - 請使用純文字，用換行或連字號 `-` 來條列重點。
-   
-2. **專注文字分析**：
-   - 用戶**不需要圖表**。
-   - 請消化數據後，用文字提供「洞察 (Insights)」。
-   - 例如：不要只列出數字，要告訴用戶「跟去年比成長了多少」或「哪個客戶佔比最高」。
+輸出 JSON schema（必須符合）：
+{
+  "table": "sales" | "purchase",
+  "metric": "amount" | "quantity",
+  "agg": "sum" | "top_customers" | "top_products" | "trend_month" | "trend_day" | "detail",
+  "keyword": "string",          // 可能是客戶/供應商/品名關鍵字，沒有就空字串
+  "year": 2025 | null,          // 有提到年份就填，沒提就 null
+  "date_from": "YYYY-MM-DD" | null,
+  "date_to": "YYYY-MM-DD" | null,
+  "limit": 5-20,                // top/detail 的筆數，預設 10
+  "want_chart": true|false,
+  "chart_type": "line"|"bar"|"pie"
+}
 
-3. **回答精簡扼要**：
-   - 除非用戶要求「詳細清單」，否則預設只給總結數據。
-   - 不要把 JSON 資料直接貼出來。
-
-4. **專注當下**：
-   - 只回答用戶最新一次輸入的問題，忽略無關的歷史對話。
-
-5. **模糊搜尋**：
-   - 用戶打錯字或打簡稱（如 "ipone", "華碩"），請自動用 `LIKE` 修正查詢。
-
-## 資料表結構
-- `sales` (銷售): date, customer, product, quantity, amount, year
-- `purchase` (採購): date, supplier, product, quantity, amount, year
+規則：
+- 使用者問「銷售/客戶/出貨/業績」→ table="sales"
+- 使用者問「採購/供應商/進貨」→ table="purchase"
+- 沒指定金額/數量時：預設 metric="amount"
+- 問「趨勢/每月/走勢」→ agg="trend_month"
+- 問「Top/排名/前幾」→ agg="top_customers" 或 "top_products"（依問題語意）
+- 沒講趨勢也沒講Top：agg="detail"
+- 想要圖表：只有使用者提「圖表/折線/長條/圓餅/畫出來/趨勢圖」才 want_chart=true
+- chart_type 預設：趨勢→line、Top→bar、占比→pie
+- keyword：抓最像的客戶/品名詞（可能有錯字，保留原樣）
+- 若使用者說「今年/去年/本月」請換算到 date_from/date_to（以台灣時間為準）
 """
 
-# =========================
-# Agent 處理邏輯
-# =========================
-async def agent_process(user_id: str, text: str, base_url: str):
-    if not client: return {"text": "API Key 未設定"}
-    
-    # 只取最近 2 輪對話，保持對話乾淨
-    history = CHAT_MEMORY.get(user_id, [])[-2:] 
-    
-    user_message = types.Content(role="user", parts=[types.Part(text=text)])
-    contents = history + [user_message]
-    
-    config = types.GenerateContentConfig(
-        tools=tools_list,
-        system_instruction=SYSTEM_PROMPT,
-        temperature=0.2 # 低溫，讓回答更收斂
-    )
-    
-    final_text = "抱歉，無法處理。"
-    
-    try:
-        response = client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=contents,
-            config=config
+@dataclass
+class Plan:
+    table: str
+    metric: str
+    agg: str
+    keyword: str
+    year: Optional[int]
+    date_from: Optional[str]
+    date_to: Optional[str]
+    limit: int
+    want_chart: bool
+    chart_type: str
+
+def parse_user_plan(user_text: str) -> Plan:
+    if not client:
+        # fallback: default safe plan
+        return Plan("sales", "amount", "detail", "", None, None, None, 10, False, "line")
+
+    taipei = now_taipei().date()
+    # give model today's date context
+    user_with_context = f"今天台灣日期是 {taipei.isoformat()}。使用者問題：{user_text}"
+
+    resp = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=[types.Content(role="user", parts=[types.Part(text=user_with_context)])],
+        config=types.GenerateContentConfig(
+            system_instruction=INTENT_SYSTEM,
+            temperature=0.1
         )
-        
-        if response.candidates:
-            candidate = response.candidates[0]
-            for _ in range(5): 
-                has_tool = False
-                for part in candidate.content.parts:
-                    if part.function_call:
-                        has_tool = True
-                        fc = part.function_call
-                        logger.info(f"Tool Call: {fc.name}")
-                        
-                        res = ""
-                        if fc.name == "execute_sql_query":
-                            res = execute_sql_query(fc.args.get("sql", ""))
-                        elif fc.name == "get_database_schema":
-                            res = get_database_schema()
-                        
-                        contents.append(candidate.content)
-                        contents.append(types.Content(
-                            role="user",
-                            parts=[types.Part(
-                                function_response=types.FunctionResponse(
-                                    name=fc.name,
-                                    response={"result": res}
-                                )
-                            )]
-                        ))
-                        
-                        response = client.models.generate_content(
-                            model="gemini-flash-latest",
-                            contents=contents,
-                            config=config
-                        )
-                        candidate = response.candidates[0]
-                        break 
-                
-                if not has_tool:
-                    final_text = response.text
-                    break
+    )
 
-        # 更新記憶
-        CHAT_MEMORY[user_id] = contents[-4:]
-        
-        # 再次過濾米字號 (雙重保險)
-        final_text = final_text.replace("*", "").replace("#", "")
-        
-        return {"text": final_text, "image": None}
-        
-    except Exception as e:
-        logger.error(f"Agent Error: {e}")
-        return {"text": f"發生錯誤: {str(e)}"}
+    raw = (resp.text or "").strip()
+    # model must output json; still guard
+    try:
+        obj = json.loads(raw)
+    except:
+        # fallback safe
+        return Plan("sales", "amount", "detail", "", None, None, None, 10, False, "line")
+
+    def clamp_limit(x):
+        try:
+            x = int(x)
+        except:
+            return 10
+        return max(5, min(20, x))
+
+    return Plan(
+        table=obj.get("table", "sales") if obj.get("table") in ["sales", "purchase"] else "sales",
+        metric=obj.get("metric", "amount") if obj.get("metric") in ["amount", "quantity"] else "amount",
+        agg=obj.get("agg", "detail"),
+        keyword=(obj.get("keyword") or "").strip(),
+        year=obj.get("year", None),
+        date_from=obj.get("date_from", None),
+        date_to=obj.get("date_to", None),
+        limit=clamp_limit(obj.get("limit", 10)),
+        want_chart=bool(obj.get("want_chart", False)),
+        chart_type=obj.get("chart_type", "line") if obj.get("chart_type") in ["line","bar","pie"] else "line"
+    )
 
 # =========================
-# API 端點
+# SQL template generator (SAFE)
+# =========================
+def build_filters(plan: Plan) -> Tuple[str, Dict[str, Any]]:
+    params: Dict[str, Any] = {}
+    where = []
+
+    # date range
+    if plan.date_from and plan.date_to:
+        where.append("date BETWEEN :date_from AND :date_to")
+        params["date_from"] = plan.date_from
+        params["date_to"] = plan.date_to
+    elif plan.year:
+        where.append("year = :year")
+        params["year"] = plan.year
+
+    # keyword fuzzy match
+    if plan.keyword:
+        like = f"%{plan.keyword}%"
+        if plan.table == "sales":
+            where.append("(customer LIKE :kw OR product LIKE :kw)")
+        else:
+            where.append("(supplier LIKE :kw OR product LIKE :kw)")
+        params["kw"] = like
+
+    clause = " WHERE " + " AND ".join(where) if where else ""
+    return clause, params
+
+def run_query(sql: str, params: Dict[str, Any]) -> pd.DataFrame:
+    with engine.connect() as conn:
+        df = pd.read_sql(text(sql), conn, params=params)
+    return df
+
+def execute_plan(plan: Plan) -> Dict[str, Any]:
+    """
+    Returns:
+    {
+      "summary": "...",
+      "table_text": "...",
+      "chart_url": Optional[str]
+    }
+    """
+    ensure_tables()
+    counts = table_counts()
+    if counts["sales"] == 0 and counts["purchase"] == 0:
+        return {
+            "summary": "系統目前沒有資料（sales/purchase 都是 0 筆）。請先匯入。",
+            "table_text": "",
+            "chart_url": None
+        }
+
+    where_clause, params = build_filters(plan)
+
+    metric_col = "amount" if plan.metric == "amount" else "quantity"
+    value_label = "金額" if plan.metric == "amount" else "數量"
+
+    # Determine group columns
+    if plan.table == "sales":
+        party_col = "customer"
+        party_label = "客戶"
+    else:
+        party_col = "supplier"
+        party_label = "供應商"
+
+    # Build SQL by agg type
+    if plan.agg == "sum":
+        sql = f"SELECT SUM({metric_col}) AS total FROM {plan.table}{where_clause};"
+        df = run_query(sql, params)
+        total = float(df.iloc[0]["total"] or 0)
+        return {
+            "summary": f"{plan.table} {value_label}總和：{total:,.2f}",
+            "table_text": "",
+            "chart_url": None
+        }
+
+    if plan.agg == "top_customers":
+        sql = f"""
+        SELECT {party_col} AS name, SUM({metric_col}) AS value
+        FROM {plan.table}
+        {where_clause}
+        GROUP BY {party_col}
+        ORDER BY value DESC
+        LIMIT :limit;
+        """
+        params2 = dict(params)
+        params2["limit"] = plan.limit
+        df = run_query(sql, params2)
+
+        if df.empty:
+            return {"summary": "查不到資料。建議：換關鍵字或移除年份/日期限制。", "table_text": "", "chart_url": None}
+
+        table_text = format_table(df, headers=[party_label, value_label], cols=["name", "value"])
+        summary = f"Top {len(df)} {party_label}（依{value_label}）"
+        chart_url = None
+        if plan.want_chart:
+            labels = df["name"].astype(str).tolist()
+            values = df["value"].astype(float).tolist()
+            chart_url = quickchart_url(plan.chart_type or "bar", summary, labels, values)
+
+        return {"summary": summary, "table_text": table_text, "chart_url": chart_url}
+
+    if plan.agg == "top_products":
+        sql = f"""
+        SELECT product AS name, SUM({metric_col}) AS value
+        FROM {plan.table}
+        {where_clause}
+        GROUP BY product
+        ORDER BY value DESC
+        LIMIT :limit;
+        """
+        params2 = dict(params)
+        params2["limit"] = plan.limit
+        df = run_query(sql, params2)
+
+        if df.empty:
+            return {"summary": "查不到資料。建議：換關鍵字或移除年份/日期限制。", "table_text": "", "chart_url": None}
+
+        table_text = format_table(df, headers=["品名", value_label], cols=["name", "value"])
+        summary = f"Top {len(df)} 品名（依{value_label}）"
+        chart_url = None
+        if plan.want_chart:
+            labels = df["name"].astype(str).tolist()
+            values = df["value"].astype(float).tolist()
+            chart_url = quickchart_url(plan.chart_type or "bar", summary, labels, values)
+
+        return {"summary": summary, "table_text": table_text, "chart_url": chart_url}
+
+    if plan.agg in ["trend_month", "trend_day"]:
+        # For SQLite/Postgres, do simple substring grouping:
+        # date stored as YYYY-MM-DD
+        if plan.agg == "trend_month":
+            group_expr = "SUBSTR(date, 1, 7)"  # YYYY-MM
+            x_label = "月份"
+        else:
+            group_expr = "date"
+            x_label = "日期"
+
+        sql = f"""
+        SELECT {group_expr} AS x, SUM({metric_col}) AS value
+        FROM {plan.table}
+        {where_clause}
+        GROUP BY {group_expr}
+        ORDER BY x ASC
+        LIMIT 60;
+        """
+        df = run_query(sql, params)
+
+        if df.empty:
+            return {"summary": "查不到趨勢資料。建議：放寬日期/年份或換關鍵字。", "table_text": "", "chart_url": None}
+
+        table_text = format_table(df, headers=[x_label, value_label], cols=["x", "value"])
+        summary = f"{x_label}{value_label}趨勢（{plan.table}）"
+        chart_url = None
+        if plan.want_chart:
+            labels = df["x"].astype(str).tolist()
+            values = df["value"].astype(float).tolist()
+            chart_url = quickchart_url(plan.chart_type or "line", summary, labels, values)
+
+        return {"summary": summary, "table_text": table_text, "chart_url": chart_url}
+
+    # Default: detail
+    if plan.table == "sales":
+        sql = f"""
+        SELECT date, customer, product, quantity, amount
+        FROM sales
+        {where_clause}
+        ORDER BY date DESC
+        LIMIT :limit;
+        """
+        params2 = dict(params)
+        params2["limit"] = plan.limit
+        df = run_query(sql, params2)
+        if df.empty:
+            # auto relax: drop year/date filters once
+            relaxed = Plan(**{**plan.__dict__, "year": None, "date_from": None, "date_to": None})
+            where2, p2 = build_filters(relaxed)
+            params3 = dict(p2); params3["limit"] = plan.limit
+            df2 = run_query(f"""
+                SELECT date, customer, product, quantity, amount
+                FROM sales
+                {where2}
+                ORDER BY date DESC
+                LIMIT :limit;
+            """, params3)
+            if df2.empty:
+                return {"summary": "查不到資料。建議：關鍵字縮短、改客戶/品名其中一個試試。", "table_text": "", "chart_url": None}
+            df = df2
+            summary = "查無資料（已自動放寬年份/日期後找到結果）"
+        else:
+            summary = "明細查詢結果"
+
+        table_text = format_table(df, headers=["日期","客戶","品名","數量","金額"], cols=["date","customer","product","quantity","amount"])
+        return {"summary": summary, "table_text": table_text, "chart_url": None}
+
+    else:
+        sql = f"""
+        SELECT date, supplier, product, quantity, amount
+        FROM purchase
+        {where_clause}
+        ORDER BY date DESC
+        LIMIT :limit;
+        """
+        params2 = dict(params)
+        params2["limit"] = plan.limit
+        df = run_query(sql, params2)
+        if df.empty:
+            relaxed = Plan(**{**plan.__dict__, "year": None, "date_from": None, "date_to": None})
+            where2, p2 = build_filters(relaxed)
+            params3 = dict(p2); params3["limit"] = plan.limit
+            df2 = run_query(f"""
+                SELECT date, supplier, product, quantity, amount
+                FROM purchase
+                {where2}
+                ORDER BY date DESC
+                LIMIT :limit;
+            """, params3)
+            if df2.empty:
+                return {"summary": "查不到資料。建議：關鍵字縮短、改供應商/品名其中一個試試。", "table_text": "", "chart_url": None}
+            df = df2
+            summary = "查無資料（已自動放寬年份/日期後找到結果）"
+        else:
+            summary = "明細查詢結果"
+
+        table_text = format_table(df, headers=["日期","供應商","品名","數量","金額"], cols=["date","supplier","product","quantity","amount"])
+        return {"summary": summary, "table_text": table_text, "chart_url": None}
+
+# =========================
+# Text table formatting (LINE friendly)
+# =========================
+def format_table(df: pd.DataFrame, headers: List[str], cols: List[str], max_width: int = 24) -> str:
+    show = df.copy()
+
+    # Convert numbers
+    for c in cols:
+        if c in show.columns:
+            if show[c].dtype.kind in "fi":
+                show[c] = show[c].apply(lambda x: 0 if x is None else x)
+
+    # Truncate
+    def trunc(s: str) -> str:
+        s = str(s)
+        return s if len(s) <= max_width else s[: max_width - 1] + "…"
+
+    for c in cols:
+        show[c] = show[c].astype(str).apply(trunc)
+
+    # column widths
+    widths = []
+    for h, c in zip(headers, cols):
+        w = max(len(h), show[c].astype(str).map(len).max())
+        widths.append(min(max_width, w))
+
+    # build lines
+    def pad(s: str, w: int) -> str:
+        s = str(s)
+        if len(s) > w:
+            s = s[: w - 1] + "…"
+        return s + " " * max(0, w - len(s))
+
+    header_line = " | ".join(pad(h, w) for h, w in zip(headers, widths))
+    sep_line = "-+-".join("-" * w for w in widths)
+
+    rows = []
+    for _, r in show.iterrows():
+        row = " | ".join(pad(r[c], w) for c, w in zip(cols, widths))
+        rows.append(row)
+
+    return "\n".join([header_line, sep_line] + rows)
+
+# =========================
+# LINE webhook handlers
+# =========================
+async def reply_line(reply_token: str, text_out: str, image_url: Optional[str] = None):
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        return
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    messages = []
+    if image_url:
+        messages.append({"type": "image", "originalContentUrl": image_url, "previewImageUrl": image_url})
+    messages.append({"type": "text", "text": text_out[:4999]})
+
+    async with httpx.AsyncClient(timeout=20) as c:
+        await c.post(
+            "https://api.line.me/v2/bot/message/reply",
+            headers=headers,
+            json={"replyToken": reply_token, "messages": messages}
+        )
+
+def verify_line_signature(body: bytes, signature: str):
+    if not LINE_CHANNEL_SECRET:
+        return
+    mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
+    expected = base64.b64encode(mac).decode("utf-8")
+    if not hmac.compare_digest(signature.strip(), expected):
+        raise HTTPException(400, "Invalid Signature")
+
+# =========================
+# API
 # =========================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "ERP Bot (Text Only)"}
+    return {"status": "ok", "service": "ERP Bot Pro"}
 
 @app.get("/health")
-def health_check():
-    return {"status": "ok"}
+def health():
+    ensure_tables()
+    return {"status": "ok", "counts": table_counts()}
+
+@app.post("/admin/reload_sync")
+def admin_reload_sync(request: Request):
+    require_admin(request)
+    report = import_from_sheets()
+    return report
 
 @app.post("/line/webhook")
-async def webhook(request: Request, background_tasks: BackgroundTasks):
+async def line_webhook(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
     signature = request.headers.get("X-Line-Signature", "")
-    
-    if LINE_CHANNEL_SECRET:
-        import hmac, hashlib, base64
-        hash_val = hmac.new(LINE_CHANNEL_SECRET.encode('utf-8'), body, hashlib.sha256).digest()
-        expected = base64.b64encode(hash_val).decode('utf-8')
-        if signature != expected: raise HTTPException(400, "Invalid Signature")
+    verify_line_signature(body, signature)
 
     try:
-        events = json.loads(body.decode("utf-8")).get("events", [])
-    except: return {"ok": False}
-    
-    base_url = f"https://{request.headers.get('host', 'localhost')}"
-    
+        payload = json.loads(body.decode("utf-8"))
+        events = payload.get("events", [])
+    except:
+        return {"ok": False}
+
     for event in events:
         if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
             user_id = event["source"]["userId"]
-            text = event["message"]["text"]
+            user_text = event["message"]["text"]
             reply_token = event["replyToken"]
-            background_tasks.add_task(handle_message, user_id, text, reply_token, base_url)
-            
+
+            if not rate_limit_ok(user_id):
+                background_tasks.add_task(reply_line, reply_token, "請稍後再試（請求過於頻繁）")
+                continue
+
+            background_tasks.add_task(handle_message, user_text, reply_token)
+
     return {"ok": True}
 
-async def handle_message(user_id: str, text: str, reply_token: str, base_url: str):
+async def handle_message(user_text: str, reply_token: str):
     try:
-        if text.lower() in ['/reset', '清除']:
-            CHAT_MEMORY.pop(user_id, None)
-            await reply_line(reply_token, "記憶已清除", None)
+        if user_text.strip().lower() in ["/help", "help", "指令"]:
+            msg = (
+                "可用問法例：\n"
+                "1) 2025 華碩銷售總額\n"
+                "2) 2025 Top 10 客戶銷售額\n"
+                "3) 今年每月銷售趨勢（畫圖）\n"
+                "4) 供應商XX採購明細\n"
+                "小技巧：加上「畫圖/折線/長條」可附圖。"
+            )
+            await reply_line(reply_token, msg)
             return
 
-        result = await agent_process(user_id, text, base_url)
-        await reply_line(reply_token, result.get("text"), None)
-    except Exception as e:
-        logger.error(f"Handle Error: {e}")
-        await reply_line(reply_token, "系統忙碌中", None)
+        plan = parse_user_plan(user_text)
+        result = execute_plan(plan)
 
-async def reply_line(token: str, text: Optional[str], img_url: Optional[str]):
-    if not LINE_CHANNEL_ACCESS_TOKEN: return
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
-    messages = []
-    # 這裡已經不需要 img_url 了，但為了相容性保留參數
-    if text: messages.append({"type": "text", "text": text[:4999]})
-    if not messages: messages.append({"type": "text", "text": "..."})
-    
-    async with httpx.AsyncClient() as c:
-        await c.post("https://api.line.me/v2/bot/message/reply", headers=headers, json={"replyToken": token, "messages": messages})
+        summary = result["summary"]
+        table_text = result["table_text"]
+        chart_url = result.get("chart_url")
+
+        # 商用輸出格式：結論 + 明細表（如有）
+        final_text = summary
+        if table_text:
+            final_text += "\n\n" + table_text
+
+        await reply_line(reply_token, final_text, chart_url)
+
+    except Exception as e:
+        logger.error(f"handle_message error: {e}")
+        await reply_line(reply_token, "系統忙碌中，請稍後再試。")
 
 @app.on_event("startup")
 async def startup():
-    """啟動時自動下載並匯入資料"""
-    try:
-        import_data_to_db()
-    except Exception as e:
-        logger.error(f"Startup Error: {e}")
+    ensure_tables()
+    if AUTO_IMPORT_ON_STARTUP:
+        try:
+            import_from_sheets()
+        except Exception as e:
+            logger.error(f"startup import error: {e}")
