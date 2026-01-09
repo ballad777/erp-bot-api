@@ -446,3 +446,14 @@ async def line_webhook(request: Request):
             print("LINE reply exception:", repr(e))
 
     return {"status": "ok"}
+@app.get("/_debug/schema")
+def debug_schema():
+    sql = """
+    SELECT table_name, column_name, data_type
+    FROM information_schema.columns
+    WHERE table_name IN ('sales','purchase')
+    ORDER BY table_name, ordinal_position;
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text(sql)).mappings().all()
+    return rows
