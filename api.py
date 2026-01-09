@@ -1,46 +1,143 @@
 import os
 import re
-import io
-import time
 import json
+import time
+import uuid
 import hmac
 import base64
 import hashlib
 from typing import Optional, Dict, Any, List, Tuple
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import Response, JSONResponse
+from fastapi import FastAPI, Query, Request, HTTPException
+from fastapi.responses import Response
 from sqlalchemy import create_engine, text
 
 import httpx
-import matplotlib.pyplot as plt
 
 # =========================
-# App / DB
+# Config
 # =========================
-app = FastAPI(title="ERP Bot API", version="2.0")
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise Exception("找不到 DATABASE_URL 環境變數")
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
-BASE_URL = os.getenv("BASE_URL", "https://erp-bot-api.onrender.com")  # 可不設，預設你現在的 Render 網址
-
-# =========================
-# LINE
-# =========================
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # 你也可以改 gemini-3-flash-preview 等
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+app = FastAPI(title="ERP Bot API", version="2.0")
+
+# =========================
+# In-memory stores (Render 無狀態，重啟會清空；但足夠用於 demo/測試)
+# =========================
+CHAT_MEMORY: Dict[str, List[Dict[str, str]]] = {}  # user_id -> [{"role":"user/assistant","content": "..."}]
+IMG_STORE: Dict[str, Dict[str, Any]] = {}          # img_id -> {"bytes": b"...", "ts": time.time()}
+IMG_TTL_SEC = 60 * 10  # 圖片保留 10 分鐘
+
+# =========================
+# Gemini client (new SDK)
+# =========================
+GEMINI_CLIENT = None
+if GEMINI_API_KEY:
+    try:
+        from google import genai  # google-genai
+        GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print("Gemini init error:", repr(e))
+        GEMINI_CLIENT = None
+
+
+# =========================
+# Helpers: LINE signature
+# =========================
 def verify_line_signature(body_bytes: bytes, signature: str) -> bool:
     if not LINE_CHANNEL_SECRET:
-        return True
+        return True  # 沒設 secret 就不驗簽（建議你最後一定要設）
     mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body_bytes, hashlib.sha256).digest()
     expected = base64.b64encode(mac).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
-async def line_reply(reply_token: str, messages: list[dict]):
+
+# =========================
+# Helpers: DB
+# =========================
+def db_one(sql: str, params: dict | None = None) -> Dict[str, Any]:
+    with engine.connect() as conn:
+        row = conn.execute(text(sql), params or {}).mappings().first()
+    return dict(row) if row else {}
+
+def db_all(sql: str, params: dict | None = None) -> List[Dict[str, Any]]:
+    with engine.connect() as conn:
+        rows = conn.execute(text(sql), params or {}).mappings().all()
+    return [dict(r) for r in rows]
+
+def safe_select_only(sql: str) -> bool:
+    # 只允許 SELECT（避免被模型生成 DROP/UPDATE）
+    s = sql.strip().lower()
+    if not s.startswith("select"):
+        return False
+    bad = ["insert", "update", "delete", "drop", "alter", "truncate", "create", "grant", "revoke"]
+    return not any(b in s for b in bad)
+
+
+# =========================
+# Helpers: parse year / topN
+# =========================
+def extract_year(text_in: str) -> Optional[int]:
+    m = re.search(r"(20\d{2})", text_in)
+    return int(m.group(1)) if m else None
+
+def extract_top_n(text_in: str, default: int = 10) -> int:
+    m = re.search(r"(?:前|top|TOP)\s*(\d+)", text_in)
+    if m:
+        n = int(m.group(1))
+        return max(1, min(100, n))
+    return default
+
+
+# =========================
+# Public endpoints
+# =========================
+@app.get("/")
+def root():
+    return {"ok": True, "service": "erp-bot-api", "version": "2.0"}
+
+@app.get("/health")
+def health():
+    v = db_one("SELECT 1 AS v").get("v", None)
+    return {"ok": True, "db": v}
+
+@app.get("/schema")
+def schema():
+    # 讓你快速確認 date 是 date / year 是 int 等
+    sql = """
+    SELECT table_name, column_name, data_type
+    FROM information_schema.columns
+    WHERE table_schema='public'
+      AND table_name IN ('sales', 'purchase')
+    ORDER BY table_name, ordinal_position;
+    """
+    return {"ok": True, "columns": db_all(sql)}
+
+@app.get("/img/{img_id}")
+def get_img(img_id: str):
+    item = IMG_STORE.get(img_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Not Found")
+    # TTL
+    if time.time() - item["ts"] > IMG_TTL_SEC:
+        IMG_STORE.pop(img_id, None)
+        raise HTTPException(status_code=404, detail="Expired")
+    return Response(content=item["bytes"], media_type="image/png")
+
+
+# =========================
+# LINE reply (text / image)
+# =========================
+async def line_reply_text(reply_token: str, text_message: str):
     if not LINE_CHANNEL_ACCESS_TOKEN:
         return
     url = "https://api.line.me/v2/bot/message/reply"
@@ -48,313 +145,317 @@ async def line_reply(reply_token: str, messages: list[dict]):
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload = {"replyToken": reply_token, "messages": messages}
+    payload = {"replyToken": reply_token, "messages": [{"type": "text", "text": text_message[:4900]}]}
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(url, headers=headers, json=payload)
         if r.status_code >= 400:
             print("LINE reply error:", r.status_code, r.text)
 
-# =========================
-# Gemini (Google GenAI SDK)
-# =========================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+async def line_reply_image(reply_token: str, image_url: str, preview_url: Optional[str] = None):
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        return
+    url = "https://api.line.me/v2/bot/message/reply"
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "replyToken": reply_token,
+        "messages": [
+            {
+                "type": "image",
+                "originalContentUrl": image_url,
+                "previewImageUrl": preview_url or image_url,
+            }
+        ],
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        if r.status_code >= 400:
+            print("LINE reply image error:", r.status_code, r.text)
 
-# 延遲 import：避免沒裝好套件時整個 service 起不來
-def get_gemini_client():
-    if not GEMINI_API_KEY:
-        return None
-    try:
-        from google import genai
-        return genai.Client(api_key=GEMINI_API_KEY)
-    except Exception as e:
-        print("Gemini client init error:", str(e))
-        return None
-
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")  # 官方範例用這個 :contentReference[oaicite:2]{index=2}
-
-# =========================
-# In-memory stores (Render 會重啟就清掉，先能用再說)
-# =========================
-# chat memory: user_id -> list[(role, text)]
-CHAT_MEM: Dict[str, List[Tuple[str, str]]] = {}
-
-# chart store: chart_id -> (bytes, mime, expire_ts)
-CHARTS: Dict[str, Tuple[bytes, str, float]] = {}
-
-def now_ts() -> float:
-    return time.time()
-
-def cleanup_charts():
-    t = now_ts()
-    expired = [k for k, (_, _, exp) in CHARTS.items() if exp <= t]
-    for k in expired:
-        del CHARTS[k]
-
-def push_mem(user_id: str, role: str, text_: str, keep: int = 12):
-    hist = CHAT_MEM.get(user_id, [])
-    hist.append((role, text_))
-    if len(hist) > keep:
-        hist = hist[-keep:]
-    CHAT_MEM[user_id] = hist
 
 # =========================
-# DB helpers (安全：只提供白名單查詢)
+# Chart generator (Matplotlib -> PNG bytes)
 # =========================
-def db_sales_summary(year: int) -> dict:
-    sql = text("""
-        SELECT
-            :year AS year,
-            COUNT(*) AS rows,
-            COALESCE(SUM(quantity), 0) AS total_qty,
-            COALESCE(SUM(amount), 0) AS total_amount
-        FROM sales
-        WHERE year = :year
-    """)
-    with engine.connect() as conn:
-        row = conn.execute(sql, {"year": year}).mappings().first()
-    return dict(row) if row else {"year": year, "rows": 0, "total_qty": 0, "total_amount": 0}
+def make_line_chart_png(title: str, x: List[Any], y: List[float], x_label: str, y_label: str) -> bytes:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from io import BytesIO
 
-def db_purchase_summary(year: int) -> dict:
-    sql = text("""
-        SELECT
-            :year AS year,
-            COUNT(*) AS rows,
-            COALESCE(SUM(quantity), 0) AS total_qty,
-            COALESCE(SUM(amount), 0) AS total_amount
-        FROM purchase
-        WHERE year = :year
-    """)
-    with engine.connect() as conn:
-        row = conn.execute(sql, {"year": year}).mappings().first()
-    return dict(row) if row else {"year": year, "rows": 0, "total_qty": 0, "total_amount": 0}
-
-def db_sales_top_products(year: int, n: int) -> list[dict]:
-    sql = text("""
-        SELECT
-            product,
-            COUNT(*) AS rows,
-            COALESCE(SUM(quantity), 0) AS total_qty,
-            COALESCE(SUM(amount), 0) AS total_amount
-        FROM sales
-        WHERE year = :year
-        GROUP BY product
-        ORDER BY total_qty DESC, rows DESC, product ASC
-        LIMIT :n
-    """)
-    with engine.connect() as conn:
-        rows = conn.execute(sql, {"year": year, "n": n}).mappings().all()
-    return [dict(r) for r in rows]
-
-def db_sales_top_customers(year: int, n: int) -> list[dict]:
-    sql = text("""
-        SELECT
-            customer,
-            COUNT(*) AS rows,
-            COALESCE(SUM(quantity), 0) AS total_qty,
-            COALESCE(SUM(amount), 0) AS total_amount
-        FROM sales
-        WHERE year = :year
-        GROUP BY customer
-        ORDER BY total_qty DESC, rows DESC, customer ASC
-        LIMIT :n
-    """)
-    with engine.connect() as conn:
-        rows = conn.execute(sql, {"year": year, "n": n}).mappings().all()
-    return [dict(r) for r in rows]
-
-def db_sales_search(q: str, year: Optional[int], limit: int = 20) -> list[dict]:
-    where_year = "AND year = :year" if year is not None else ""
-    sql = text(f"""
-        SELECT date, year, customer, product, quantity, amount
-        FROM sales
-        WHERE (customer ILIKE :pat OR product ILIKE :pat)
-        {where_year}
-        ORDER BY date DESC
-        LIMIT :limit
-    """)
-    params = {"pat": f"%{q}%", "limit": limit}
-    if year is not None:
-        params["year"] = year
-    with engine.connect() as conn:
-        rows = conn.execute(sql, params).mappings().all()
-    return [dict(r) for r in rows]
-
-def db_purchase_top_products(year: int, n: int) -> list[dict]:
-    sql = text("""
-        SELECT
-            product,
-            COUNT(*) AS rows,
-            COALESCE(SUM(quantity), 0) AS total_qty,
-            COALESCE(SUM(amount), 0) AS total_amount
-        FROM purchase
-        WHERE year = :year
-        GROUP BY product
-        ORDER BY total_qty DESC, rows DESC, product ASC
-        LIMIT :n
-    """)
-    with engine.connect() as conn:
-        rows = conn.execute(sql, {"year": year, "n": n}).mappings().all()
-    return [dict(r) for r in rows]
-
-def db_purchase_search(q: str, year: Optional[int], limit: int = 20) -> list[dict]:
-    where_year = "AND year = :year" if year is not None else ""
-    sql = text(f"""
-        SELECT date, year, supplier, product, quantity, amount
-        FROM purchase
-        WHERE (supplier ILIKE :pat OR product ILIKE :pat)
-        {where_year}
-        ORDER BY date DESC
-        LIMIT :limit
-    """)
-    params = {"pat": f"%{q}%", "limit": limit}
-    if year is not None:
-        params["year"] = year
-    with engine.connect() as conn:
-        rows = conn.execute(sql, params).mappings().all()
-    return [dict(r) for r in rows]
-
-# =========================
-# Chart generation (A 方法：回 LINE 圖)
-# =========================
-def make_bar_chart(title: str, labels: list[str], values: list[float]) -> bytes:
     plt.figure()
+    plt.plot(x, y)
     plt.title(title)
-    plt.bar(labels, values)
-    plt.xticks(rotation=45, ha="right")
+    plt.xlabel(x_label)
+    plt.ylabel(y_label)
     plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=150)
+
+    buf = BytesIO()
+    plt.savefig(buf, format="png", dpi=160)
     plt.close()
     return buf.getvalue()
 
-def save_chart_bytes(png_bytes: bytes, ttl_sec: int = 300) -> str:
-    cleanup_charts()
-    chart_id = hashlib.sha256(png_bytes + str(now_ts()).encode("utf-8")).hexdigest()[:16]
-    CHARTS[chart_id] = (png_bytes, "image/png", now_ts() + ttl_sec)
-    return chart_id
+def make_bar_chart_png(title: str, x: List[Any], y: List[float], x_label: str, y_label: str) -> bytes:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from io import BytesIO
 
-@app.get("/charts/{chart_id}.png")
-def get_chart(chart_id: str):
-    cleanup_charts()
-    if chart_id not in CHARTS:
-        return JSONResponse({"detail": "Not Found"}, status_code=404)
-    data, mime, exp = CHARTS[chart_id]
-    return Response(content=data, media_type=mime)
+    plt.figure()
+    plt.bar(x, y)
+    plt.title(title)
+    plt.xlabel(x_label)
+    plt.ylabel(y_label)
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+
+    buf = BytesIO()
+    plt.savefig(buf, format="png", dpi=160)
+    plt.close()
+    return buf.getvalue()
+
 
 # =========================
-# Intent routing by Gemini
+# Weather (免費 Open-Meteo，免 key)
+# =========================
+async def weather_by_city(city: str) -> str:
+    # 先用 geocoding 找經緯度
+    geo_url = "https://geocoding-api.open-meteo.com/v1/search"
+    async with httpx.AsyncClient(timeout=15) as client:
+        g = await client.get(geo_url, params={"name": city, "count": 1, "language": "zh", "format": "json"})
+        data = g.json()
+        if not data.get("results"):
+            return f"我找不到「{city}」的位置。你可以換成：台北 / 新北 / 台中 / 高雄 之類的。"
+        r0 = data["results"][0]
+        lat, lon = r0["latitude"], r0["longitude"]
+        name = r0.get("name", city)
+
+        w_url = "https://api.open-meteo.com/v1/forecast"
+        w = await client.get(
+            w_url,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,weather_code,wind_speed_10m",
+                "timezone": "Asia/Taipei",
+            },
+        )
+        wd = w.json()
+        cur = wd.get("current", {})
+        t = cur.get("temperature_2m")
+        wind = cur.get("wind_speed_10m")
+        code = cur.get("weather_code")
+        return f"【{name} 即時天氣】\n溫度：{t}°C\n風速：{wind} m/s\n代碼：{code}（需要我把代碼轉成文字描述也可以）"
+
+
+# =========================
+# Core: deterministic data functions
+# =========================
+def sales_summary(year: int) -> Dict[str, Any]:
+    sql = """
+    SELECT :year AS year,
+           COUNT(*) AS rows,
+           COALESCE(SUM(quantity), 0) AS total_qty,
+           COALESCE(SUM(amount), 0) AS total_amount
+    FROM sales
+    WHERE year = :year
+    """
+    row = db_one(sql, {"year": year})
+    if not row:
+        return {"year": year, "rows": 0, "total_qty": 0, "total_amount": 0}
+    return row
+
+def sales_top_products(year: int, n: int) -> List[Dict[str, Any]]:
+    sql = """
+    SELECT product,
+           COUNT(*) AS rows,
+           COALESCE(SUM(quantity), 0) AS total_qty,
+           COALESCE(SUM(amount), 0) AS total_amount
+    FROM sales
+    WHERE year = :year
+    GROUP BY product
+    ORDER BY total_qty DESC, rows DESC, product ASC
+    LIMIT :n
+    """
+    return db_all(sql, {"year": year, "n": n})
+
+def sales_top_customers(year: int, n: int) -> List[Dict[str, Any]]:
+    sql = """
+    SELECT customer,
+           COUNT(*) AS rows,
+           COALESCE(SUM(quantity), 0) AS total_qty,
+           COALESCE(SUM(amount), 0) AS total_amount
+    FROM sales
+    WHERE year = :year
+    GROUP BY customer
+    ORDER BY total_qty DESC, rows DESC, customer ASC
+    LIMIT :n
+    """
+    return db_all(sql, {"year": year, "n": n})
+
+def sales_search(keyword: str, year: Optional[int], limit: int = 30) -> List[Dict[str, Any]]:
+    where_year = "AND year = :year" if year is not None else ""
+    sql = f"""
+    SELECT date, year, customer, product, quantity, amount
+    FROM sales
+    WHERE (customer ILIKE :pat OR product ILIKE :pat)
+      {where_year}
+    ORDER BY date DESC
+    LIMIT :limit
+    """
+    params = {"pat": f"%{keyword}%", "limit": limit}
+    if year is not None:
+        params["year"] = year
+    return db_all(sql, params)
+
+def purchase_summary(year: int) -> Dict[str, Any]:
+    sql = """
+    SELECT :year AS year,
+           COUNT(*) AS rows,
+           COALESCE(SUM(quantity), 0) AS total_qty,
+           COALESCE(SUM(amount), 0) AS total_amount
+    FROM purchase
+    WHERE year = :year
+    """
+    row = db_one(sql, {"year": year})
+    if not row:
+        return {"year": year, "rows": 0, "total_qty": 0, "total_amount": 0}
+    return row
+
+def purchase_top_products(year: int, n: int) -> List[Dict[str, Any]]:
+    sql = """
+    SELECT product,
+           COUNT(*) AS rows,
+           COALESCE(SUM(quantity), 0) AS total_qty,
+           COALESCE(SUM(amount), 0) AS total_amount
+    FROM purchase
+    WHERE year = :year
+    GROUP BY product
+    ORDER BY total_qty DESC, rows DESC, product ASC
+    LIMIT :n
+    """
+    return db_all(sql, {"year": year, "n": n})
+
+def purchase_search(keyword: str, year: Optional[int], limit: int = 30) -> List[Dict[str, Any]]:
+    where_year = "AND year = :year" if year is not None else ""
+    sql = f"""
+    SELECT date, year, supplier, product, quantity, amount
+    FROM purchase
+    WHERE (supplier ILIKE :pat OR product ILIKE :pat)
+      {where_year}
+    ORDER BY date DESC
+    LIMIT :limit
+    """
+    params = {"pat": f"%{keyword}%", "limit": limit}
+    if year is not None:
+        params["year"] = year
+    return db_all(sql, params)
+
+def sales_monthly_amount_chart(year: int) -> Tuple[str, bytes]:
+    sql = """
+    SELECT to_char(date, 'YYYY-MM') AS ym, COALESCE(SUM(amount),0) AS total_amount
+    FROM sales
+    WHERE year = :year
+    GROUP BY ym
+    ORDER BY ym
+    """
+    rows = db_all(sql, {"year": year})
+    x = [r["ym"] for r in rows]
+    y = [float(r["total_amount"]) for r in rows]
+    png = make_line_chart_png(f"Sales Monthly Amount {year}", x, y, "Month", "Amount")
+    return ("line", png)
+
+def sales_monthly_qty_chart(year: int) -> Tuple[str, bytes]:
+    sql = """
+    SELECT to_char(date, 'YYYY-MM') AS ym, COALESCE(SUM(quantity),0) AS total_qty
+    FROM sales
+    WHERE year = :year
+    GROUP BY ym
+    ORDER BY ym
+    """
+    rows = db_all(sql, {"year": year})
+    x = [r["ym"] for r in rows]
+    y = [float(r["total_qty"]) for r in rows]
+    png = make_line_chart_png(f"Sales Monthly Qty {year}", x, y, "Month", "Quantity")
+    return ("line", png)
+
+
+# =========================
+# Gemini: natural language router -> JSON intent
 # =========================
 ROUTER_SYSTEM = """
-你是一個 ERP 助理，能跟使用者自然聊天，也能讀取 ERP 後端資料(銷售/進貨)並做簡單分析。
-你必須輸出「純 JSON」(不要 markdown)，格式如下：
+你是一個 ERP LINE AI 助手。你要做兩件事：
+1) 能像一般聊天機器人一樣自然對話。
+2) 只要使用者的問題涉及「銷售 sales」或「進貨 purchase」資料查詢/分析/圖表，你要輸出一個 JSON 指令讓後端去查資料並回覆。
 
+【你只能輸出 JSON，不能輸出其他文字】
+JSON 格式：
 {
-  "type": "chat" | "db" | "chart",
-  "chat": {"text": "..."}                 // type=chat
-  "db": {"action": "...", "params": {...}} // type=db
-  "chart": {"action": "...", "params": {...}, "caption": "..."} // type=chart
+  "type": "chat" | "data",
+  "intent": "...",
+  "params": { ... }
 }
 
-允許的 db/chart action 白名單如下（只能選這些）：
-- sales_summary: {year:int}
-- purchase_summary: {year:int}
-- sales_top_products: {year:int, n:int}
-- sales_top_customers: {year:int, n:int}
-- sales_search: {q:str, year:int|null}
-- purchase_top_products: {year:int, n:int}
-- purchase_search: {q:str, year:int|null}
+可用 intent（type=data 時）：
+- "sales_summary" params: {"year": 2025}
+- "sales_top_products" params: {"year": 2025, "n": 10}
+- "sales_top_customers" params: {"year": 2025, "n": 10}
+- "sales_search" params: {"keyword": "ABC", "year": 2025|null}
+- "purchase_summary" params: {"year": 2024}
+- "purchase_top_products" params: {"year": 2024, "n": 10}
+- "purchase_search" params: {"keyword": "ABC", "year": 2024|null}
+- "sales_chart_monthly_amount" params: {"year": 2025}
+- "sales_chart_monthly_qty" params: {"year": 2025}
+- "weather" params: {"city": "台北"}
 
 規則：
-1) 使用者只是聊天/閒聊/問你是誰 -> type=chat，正常回覆。
-2) 使用者問銷售/進貨數據 -> type=db 或 type=chart。
-3) 使用者要求「圖表/趨勢/長條圖/比較」-> type=chart（優先）。
-4) 若缺少年份，合理猜：若問題有提到年份用它；沒提就回 chat 追問（但仍輸出 JSON）。
-5) 回覆要簡短、像真人，不要機械式指令教學。
+- 使用者如果只是聊天/閒聊/問你是誰/要你幫忙寫文案/工作建議 → type=chat, intent="general"
+- 只要牽涉到資料（例如：某客戶金額、某產品數量、排行、趨勢、圖表、查詢）→ type=data
+- year 沒講：優先推測為今年（如果看起來像要今年），不確定就填 null 並改用 search 或請對方補年份（但仍輸出 JSON）
+- keyword 允許使用者打錯字（維持原字串），後端會用 ILIKE 模糊查
+- 想要圖表（折線/趨勢/每月）就用 chart intents
 """
 
-def safe_int(v: Any, default: int, lo: int, hi: int) -> int:
+def keep_history(user_id: str, role: str, content: str, limit: int = 12):
+    h = CHAT_MEMORY.get(user_id, [])
+    h.append({"role": role, "content": content})
+    CHAT_MEMORY[user_id] = h[-limit:]
+
+async def gemini_route(user_id: str, user_text: str) -> Dict[str, Any]:
+    if not GEMINI_CLIENT:
+        raise RuntimeError("Gemini client not ready")
+
+    # 給模型一些上下文（短記憶）
+    history = CHAT_MEMORY.get(user_id, [])
+    contents = []
+    contents.append({"role": "user", "parts": [{"text": ROUTER_SYSTEM}]})
+    for m in history:
+        contents.append({"role": m["role"], "parts": [{"text": m["content"]}]})
+    contents.append({"role": "user", "parts": [{"text": user_text}]})
+
+    resp = GEMINI_CLIENT.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
+    )
+    txt = (resp.text or "").strip()
+
+    # 只接受 JSON
     try:
-        x = int(v)
-        return max(lo, min(hi, x))
+        data = json.loads(txt)
+        if isinstance(data, dict) and "type" in data:
+            return data
     except Exception:
-        return default
+        pass
 
-async def gemini_route(user_id: str, user_text: str) -> dict:
-    client = get_gemini_client()
-    if client is None:
-        return {"type": "chat", "chat": {"text": "我目前 AI 模型沒設定好，但你可以先問我銷售/進貨資料或叫我做排行/搜尋。"}}
+    # JSON 失敗就當 chat
+    return {"type": "chat", "intent": "general", "params": {"fallback": True, "text": txt[:1500]}}
 
-    # 組對話上下文（讓它更像聊天）
-    hist = CHAT_MEM.get(user_id, [])
-    # 只帶最近幾輪，避免爆 token
-    context_lines = []
-    for role, txt in hist[-8:]:
-        context_lines.append(f"{role}: {txt}")
-    context = "\n".join(context_lines)
-
-    prompt = f"""{ROUTER_SYSTEM}
-
-【對話上下文】
-{context}
-
-【使用者輸入】
-{user_text}
-
-請輸出純 JSON："""
-
-    try:
-        resp = client.models.generate_content(
-            model=GEMINI_MODEL_NAME,
-            contents=prompt,
-        )
-        raw = (resp.text or "").strip()
-        # 有些模型會在前後夾雜文字，這裡硬抓第一個 JSON 區塊
-        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-        if not m:
-            return {"type": "chat", "chat": {"text": "我看得懂，但我需要你再說清楚一點：你想查銷售還是進貨？要哪一年？"}}
-        obj = json.loads(m.group(0))
-        return obj
-    except Exception as e:
-        print("Gemini route error:", str(e))
-        # 不要 500，退回可用模式
-        return {"type": "chat", "chat": {"text": "我剛剛 AI 有點連不上，但你可以直接說：例如「2025 銷售總覽」或「2025 銷售前10產品」或「銷售搜尋 ABC」。"}}
 
 # =========================
-# Execute actions
+# Execute intent
 # =========================
-def run_db_action(action: str, params: dict) -> dict:
-    if action == "sales_summary":
-        year = safe_int(params.get("year"), 2025, 2000, 2100)
-        return db_sales_summary(year)
-    if action == "purchase_summary":
-        year = safe_int(params.get("year"), 2025, 2000, 2100)
-        return db_purchase_summary(year)
-    if action == "sales_top_products":
-        year = safe_int(params.get("year"), 2025, 2000, 2100)
-        n = safe_int(params.get("n"), 10, 1, 50)
-        return {"year": year, "top_products": db_sales_top_products(year, n)}
-    if action == "sales_top_customers":
-        year = safe_int(params.get("year"), 2025, 2000, 2100)
-        n = safe_int(params.get("n"), 10, 1, 50)
-        return {"year": year, "top_customers": db_sales_top_customers(year, n)}
-    if action == "sales_search":
-        q = str(params.get("q") or "").strip()
-        year = params.get("year", None)
-        year_val = safe_int(year, 0, 2000, 2100) if year is not None else None
-        return {"q": q, "year": year_val, "rows": db_sales_search(q, year_val, 20)}
-    if action == "purchase_top_products":
-        year = safe_int(params.get("year"), 2025, 2000, 2100)
-        n = safe_int(params.get("n"), 10, 1, 50)
-        return {"year": year, "top_products": db_purchase_top_products(year, n)}
-    if action == "purchase_search":
-        q = str(params.get("q") or "").strip()
-        year = params.get("year", None)
-        year_val = safe_int(year, 0, 2000, 2100) if year is not None else None
-        return {"q": q, "year": year_val, "rows": db_purchase_search(q, year_val, 20)}
-
-    return {"error": "unknown_action"}
-
-def format_summary(title: str, d: dict) -> str:
+def format_summary(title: str, d: Dict[str, Any]) -> str:
     return (
         f"{title}\n"
         f"年：{d.get('year')}\n"
@@ -363,19 +464,176 @@ def format_summary(title: str, d: dict) -> str:
         f"總金額：{d.get('total_amount')}\n"
     )
 
-# =========================
-# Routes
-# =========================
-@app.get("/health")
-def health():
-    with engine.connect() as conn:
-        v = conn.execute(text("SELECT 1")).scalar()
-    return {"ok": True, "db": v}
+def format_top(title: str, rows: List[Dict[str, Any]], name_key: str) -> str:
+    lines = [title]
+    for i, r in enumerate(rows, 1):
+        nm = r.get(name_key, "")
+        qty = r.get("total_qty", 0)
+        cnt = r.get("rows", 0)
+        amt = r.get("total_amount", 0)
+        lines.append(f"{i}. {nm}｜數量 {qty}｜筆數 {cnt}｜金額 {amt}")
+    return "\n".join(lines)
 
-@app.get("/")
-def root():
-    return {"ok": True, "hint": "Use /health or LINE webhook /line/webhook"}
+def format_sales_rows(rows: List[Dict[str, Any]], keyword: str, year: Optional[int]) -> str:
+    if not rows:
+        return f"找不到：{keyword}"
+    head = f"【銷售搜尋】{keyword}（年：{year if year else '不限'}）"
+    lines = [head]
+    for r in rows[:30]:
+        lines.append(f"{r['date']}｜{r['customer']}｜{r['product']}｜數量 {r['quantity']}｜金額 {r['amount']}")
+    return "\n".join(lines)
 
+def format_purchase_rows(rows: List[Dict[str, Any]], keyword: str, year: Optional[int]) -> str:
+    if not rows:
+        return f"找不到：{keyword}"
+    head = f"【進貨搜尋】{keyword}（年：{year if year else '不限'}）"
+    lines = [head]
+    for r in rows[:30]:
+        lines.append(f"{r['date']}｜{r['supplier']}｜{r['product']}｜數量 {r['quantity']}｜金額 {r['amount']}")
+    return "\n".join(lines)
+
+async def execute_intent(route: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+    """
+    return:
+      {"kind":"text","text":"..."}
+      or {"kind":"image","url":"..."}
+    """
+    t = route.get("type")
+    intent = route.get("intent", "")
+    params = route.get("params", {}) or {}
+
+    # chat
+    if t == "chat":
+        # 如果 Gemini 有回傳 fallback text，就用它；不然用簡單回覆
+        txt = params.get("text")
+        if txt:
+            return {"kind": "text", "text": txt}
+        return {"kind": "text", "text": "我在～你想聊什麼？也可以直接問我銷售/進貨資料或要我做趨勢圖。"}
+
+    # data intents
+    try:
+        if intent == "sales_summary":
+            year = int(params.get("year"))
+            return {"kind": "text", "text": format_summary("【銷售總覽】", sales_summary(year))}
+
+        if intent == "sales_top_products":
+            year = int(params.get("year"))
+            n = int(params.get("n", 10))
+            return {"kind": "text", "text": format_top(f"【銷售 前{n} 產品｜依數量】(年 {year})", sales_top_products(year, n), "product")}
+
+        if intent == "sales_top_customers":
+            year = int(params.get("year"))
+            n = int(params.get("n", 10))
+            return {"kind": "text", "text": format_top(f"【銷售 前{n} 客戶｜依數量】(年 {year})", sales_top_customers(year, n), "customer")}
+
+        if intent == "sales_search":
+            keyword = str(params.get("keyword", "")).strip()
+            year = params.get("year", None)
+            year = int(year) if year else None
+            rows = sales_search(keyword, year, limit=30)
+            return {"kind": "text", "text": format_sales_rows(rows, keyword, year)}
+
+        if intent == "purchase_summary":
+            year = int(params.get("year"))
+            return {"kind": "text", "text": format_summary("【進貨總覽】", purchase_summary(year))}
+
+        if intent == "purchase_top_products":
+            year = int(params.get("year"))
+            n = int(params.get("n", 10))
+            return {"kind": "text", "text": format_top(f"【進貨 前{n} 產品｜依數量】(年 {year})", purchase_top_products(year, n), "product")}
+
+        if intent == "purchase_search":
+            keyword = str(params.get("keyword", "")).strip()
+            year = params.get("year", None)
+            year = int(year) if year else None
+            rows = purchase_search(keyword, year, limit=30)
+            return {"kind": "text", "text": format_purchase_rows(rows, keyword, year)}
+
+        if intent == "sales_chart_monthly_amount":
+            year = int(params.get("year"))
+            _, png = sales_monthly_amount_chart(year)
+            img_id = str(uuid.uuid4())
+            IMG_STORE[img_id] = {"bytes": png, "ts": time.time()}
+            return {"kind": "image", "url": f"{base_url}/img/{img_id}"}
+
+        if intent == "sales_chart_monthly_qty":
+            year = int(params.get("year"))
+            _, png = sales_monthly_qty_chart(year)
+            img_id = str(uuid.uuid4())
+            IMG_STORE[img_id] = {"bytes": png, "ts": time.time()}
+            return {"kind": "image", "url": f"{base_url}/img/{img_id}"}
+
+        if intent == "weather":
+            city = str(params.get("city", "")).strip() or "台北"
+            txt = await weather_by_city(city)
+            return {"kind": "text", "text": txt}
+
+        # Unknown intent
+        return {"kind": "text", "text": "我理解你想查資料/分析，但我還不確定要怎麼做。你可以換個說法或補：年份、客戶、產品。"}
+
+    except Exception as e:
+        return {"kind": "text", "text": f"資料處理出錯：{type(e).__name__}: {e}"}
+
+
+# =========================
+# Fallback parser (當 Gemini 掛了/被限流時)
+# =========================
+def fallback_rule_route(user_text: str) -> Dict[str, Any]:
+    t = user_text.strip()
+    y = extract_year(t)
+    n = extract_top_n(t, 10)
+
+    # 天氣
+    if "天氣" in t:
+        # 盡量抓城市
+        m = re.search(r"(台北|新北|桃園|台中|台南|高雄|基隆|新竹|嘉義|宜蘭|花蓮|台東)", t)
+        city = m.group(1) if m else "台北"
+        return {"type": "data", "intent": "weather", "params": {"city": city}}
+
+    # 銷售
+    if "銷售" in t:
+        if "總覽" in t or "總結" in t:
+            return {"type": "data", "intent": "sales_summary", "params": {"year": y or time.localtime().tm_year}}
+        if ("趨勢" in t or "折線" in t or "每月" in t) and ("金額" in t or "業績" in t):
+            return {"type": "data", "intent": "sales_chart_monthly_amount", "params": {"year": y or time.localtime().tm_year}}
+        if ("趨勢" in t or "折線" in t or "每月" in t) and ("數量" in t):
+            return {"type": "data", "intent": "sales_chart_monthly_qty", "params": {"year": y or time.localtime().tm_year}}
+        if ("前" in t or "top" in t.lower()) and ("產品" in t or "品項" in t):
+            return {"type": "data", "intent": "sales_top_products", "params": {"year": y or time.localtime().tm_year, "n": n}}
+        if ("前" in t or "top" in t.lower()) and ("客戶" in t):
+            return {"type": "data", "intent": "sales_top_customers", "params": {"year": y or time.localtime().tm_year, "n": n}}
+        if "查" in t or "搜尋" in t or "search" in t.lower():
+            kw = re.sub(r".*(搜尋|search|查)\s*", "", t, flags=re.IGNORECASE).strip()
+            kw = re.sub(r"20\d{2}", "", kw).strip()
+            if not kw:
+                kw = t.replace("銷售", "").strip()
+            return {"type": "data", "intent": "sales_search", "params": {"keyword": kw, "year": y}}
+
+        # 沒抓到就當 chat
+        return {"type": "chat", "intent": "general", "params": {"text": "你是想查銷售資料嗎？你可以說：\n- 2025 銷售總覽\n- 2025 銷售前10客戶\n- 2025 銷售每月金額趨勢\n- 查 銷售 ABC"}}
+
+    # 進貨
+    if "進貨" in t or "採購" in t:
+        if "總覽" in t or "總結" in t:
+            return {"type": "data", "intent": "purchase_summary", "params": {"year": y or time.localtime().tm_year}}
+        if ("前" in t or "top" in t.lower()) and ("產品" in t or "品項" in t):
+            return {"type": "data", "intent": "purchase_top_products", "params": {"year": y or time.localtime().tm_year, "n": n}}
+        if "查" in t or "搜尋" in t or "search" in t.lower():
+            kw = re.sub(r".*(搜尋|search|查)\s*", "", t, flags=re.IGNORECASE).strip()
+            kw = re.sub(r"20\d{2}", "", kw).strip()
+            if not kw:
+                kw = t.replace("進貨", "").replace("採購", "").strip()
+            return {"type": "data", "intent": "purchase_search", "params": {"keyword": kw, "year": y}}
+
+        return {"type": "chat", "intent": "general", "params": {"text": "你是想查進貨資料嗎？你可以說：\n- 2024 進貨總覽\n- 2024 進貨前10產品\n- 2024 進貨搜尋 XYZ"}}
+
+    # 其他就聊天
+    return {"type": "chat", "intent": "general", "params": {"text": "我在～你想聊什麼？也可以問：某客戶今年買了多少、某產品銷售趨勢、要我畫折線圖。"}}
+
+
+# =========================
+# LINE Webhook
+# =========================
 @app.post("/line/webhook")
 async def line_webhook(request: Request):
     body_bytes = await request.body()
@@ -387,6 +645,11 @@ async def line_webhook(request: Request):
     body = json.loads(body_bytes.decode("utf-8"))
     events = body.get("events", [])
 
+    # 用 request 的 host 組出圖片 URL（Render 會是 https）
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    proto = request.headers.get("x-forwarded-proto") or "https"
+    base_url = f"{proto}://{host}"
+
     for ev in events:
         if ev.get("type") != "message":
             continue
@@ -395,155 +658,37 @@ async def line_webhook(request: Request):
             continue
 
         reply_token = ev.get("replyToken")
-        user_text = msg.get("text", "")
-        user_id = (ev.get("source", {}) or {}).get("userId", "unknown")
-
-        # 記憶：使用者講了什麼
-        push_mem(user_id, "user", user_text)
-
-        route = await gemini_route(user_id, user_text)
-
-        # type=chat
-        if route.get("type") == "chat":
-            text_out = (route.get("chat", {}) or {}).get("text", "").strip()
-            if not text_out:
-                text_out = "我在～你想聊什麼？也可以問我銷售/進貨、排行、搜尋、或叫我畫圖。"
-            push_mem(user_id, "assistant", text_out)
-            await line_reply(reply_token, [{"type": "text", "text": text_out[:4900]}])
+        user_id = (ev.get("source") or {}).get("userId", "unknown")
+        user_text = (msg.get("text") or "").strip()
+        if not user_text:
             continue
 
-        # type=db
-        if route.get("type") == "db":
-            dbinfo = route.get("db", {}) or {}
-            action = str(dbinfo.get("action") or "")
-            params = dbinfo.get("params", {}) or {}
-            data = run_db_action(action, params)
+        # 先記 user message
+        keep_history(user_id, "user", user_text)
 
-            # 依 action 友善輸出
-            if action == "sales_summary":
-                text_out = format_summary("【銷售總覽】", data)
-            elif action == "purchase_summary":
-                text_out = format_summary("【進貨總覽】", data)
-            elif action == "sales_top_products":
-                rows = data.get("top_products", [])
-                year = data.get("year")
-                lines = [f"【銷售 前{len(rows)} 產品｜依數量】(年 {year})"]
-                for i, r in enumerate(rows, 1):
-                    lines.append(f"{i}. {r.get('product')}｜數量 {r.get('total_qty')}｜金額 {r.get('total_amount')}")
-                text_out = "\n".join(lines)
-            elif action == "sales_top_customers":
-                rows = data.get("top_customers", [])
-                year = data.get("year")
-                lines = [f"【銷售 前{len(rows)} 客戶｜依數量】(年 {year})"]
-                for i, r in enumerate(rows, 1):
-                    lines.append(f"{i}. {r.get('customer')}｜數量 {r.get('total_qty')}｜金額 {r.get('total_amount')}")
-                text_out = "\n".join(lines)
-            elif action == "sales_search":
-                rows = data.get("rows", [])
-                q = data.get("q")
-                year = data.get("year")
-                if not rows:
-                    text_out = f"【銷售搜尋】找不到：{q}"
-                else:
-                    lines = [f"【銷售搜尋】{q}（年：{year if year else '不限'}）"]
-                    for r in rows[:20]:
-                        lines.append(f"{r['date']}｜{r['customer']}｜{r['product']}｜數量 {r['quantity']}｜金額 {r['amount']}")
-                    text_out = "\n".join(lines)
-            elif action == "purchase_top_products":
-                rows = data.get("top_products", [])
-                year = data.get("year")
-                lines = [f"【進貨 前{len(rows)} 產品｜依數量】(年 {year})"]
-                for i, r in enumerate(rows, 1):
-                    lines.append(f"{i}. {r.get('product')}｜數量 {r.get('total_qty')}｜金額 {r.get('total_amount')}")
-                text_out = "\n".join(lines)
-            elif action == "purchase_search":
-                rows = data.get("rows", [])
-                q = data.get("q")
-                year = data.get("year")
-                if not rows:
-                    text_out = f"【進貨搜尋】找不到：{q}"
-                else:
-                    lines = [f"【進貨搜尋】{q}（年：{year if year else '不限'}）"]
-                    for r in rows[:20]:
-                        lines.append(f"{r['date']}｜{r['supplier']}｜{r['product']}｜數量 {r['quantity']}｜金額 {r['amount']}")
-                    text_out = "\n".join(lines)
-            else:
-                text_out = "我查到資料了，但不知道怎麼整理輸出（action 不在預期內）。"
+        # 1) 先走 Gemini（若可用）
+        route = None
+        if GEMINI_CLIENT:
+            try:
+                route = await gemini_route(user_id, user_text)
+            except Exception as e:
+                # Gemini 掛了就走 fallback
+                print("Gemini route error:", repr(e))
+                route = None
 
-            push_mem(user_id, "assistant", text_out)
-            await line_reply(reply_token, [{"type": "text", "text": text_out[:4900]}])
-            continue
+        # 2) Gemini 不可用 / 解析失敗 -> fallback
+        if not route:
+            route = fallback_rule_route(user_text)
 
-        # type=chart
-        if route.get("type") == "chart":
-            cinfo = route.get("chart", {}) or {}
-            action = str(cinfo.get("action") or "")
-            params = cinfo.get("params", {}) or {}
-            caption = str(cinfo.get("caption") or "").strip() or "圖表如下"
+        # 3) 執行 intent
+        result = await execute_intent(route, base_url=base_url)
 
-            # 我們先用 db action 拿資料，再畫圖
-            # 目前先支援：sales_top_products / sales_top_customers / purchase_top_products
-            data = run_db_action(action, params)
-
-            png = None
-            if action == "sales_top_products":
-                rows = data.get("top_products", [])
-                year = data.get("year")
-                labels = [r.get("product", "")[:10] for r in rows]
-                values = [float(r.get("total_qty") or 0) for r in rows]
-                png = make_bar_chart(f"Sales Top Products {year}", labels, values)
-
-            elif action == "sales_top_customers":
-                rows = data.get("top_customers", [])
-                year = data.get("year")
-                labels = [r.get("customer", "")[:10] for r in rows]
-                values = [float(r.get("total_qty") or 0) for r in rows]
-                png = make_bar_chart(f"Sales Top Customers {year}", labels, values)
-
-            elif action == "purchase_top_products":
-                rows = data.get("top_products", [])
-                year = data.get("year")
-                labels = [r.get("product", "")[:10] for r in rows]
-                values = [float(r.get("total_qty") or 0) for r in rows]
-                png = make_bar_chart(f"Purchase Top Products {year}", labels, values)
-
-            if not png:
-                text_out = "我懂你要圖，但我目前只會畫：銷售/進貨的前N排行長條圖。你可以說「畫 2025 銷售前10產品圖」。"
-                push_mem(user_id, "assistant", text_out)
-                await line_reply(reply_token, [{"type": "text", "text": text_out[:4900]}])
-                continue
-
-            chart_id = save_chart_bytes(png, ttl_sec=300)
-            img_url = f"{BASE_URL}/charts/{chart_id}.png"
-
-            # LINE 圖片訊息
-            messages = [
-                {"type": "text", "text": caption[:4900]},
-                {
-                    "type": "image",
-                    "originalContentUrl": img_url,
-                    "previewImageUrl": img_url,
-                },
-            ]
-            push_mem(user_id, "assistant", caption)
-            await line_reply(reply_token, messages)
-            continue
-
-        # unknown
-        await line_reply(reply_token, [{"type": "text", "text": "我有點看不懂你的意思，你可以再講一次～"}])
+        # 4) 回 LINE
+        if result["kind"] == "image":
+            await line_reply_image(reply_token, result["url"])
+            keep_history(user_id, "assistant", f"[image]{result['url']}")
+        else:
+            await line_reply_text(reply_token, result["text"])
+            keep_history(user_id, "assistant", result["text"])
 
     return {"status": "ok"}
-
-# 你之前拿到 columns 的 endpoint（保留給你 debug）
-@app.get("/debug/columns")
-def debug_columns():
-    sql = text("""
-        SELECT table_name, column_name, data_type
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name IN ('sales', 'purchase')
-        ORDER BY table_name, ordinal_position
-    """)
-    with engine.connect() as conn:
-        rows = conn.execute(sql).mappings().all()
-    return {"ok": True, "columns": [dict(r) for r in rows]}
