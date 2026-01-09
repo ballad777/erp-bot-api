@@ -262,7 +262,7 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
             logger.info(f"Agent 第 {turn} 輪處理")
             
             response = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-flash-latest",
                 contents=contents,
                 config=config
             )
