@@ -9,3 +9,4 @@ python-dotenv==1.0.1
 matplotlib==3.9.2
 google-genai>=0.3.0
 python-multipart
+apscheduler==3.10.4
