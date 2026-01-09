@@ -24,7 +24,7 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Smart ERP Bot", version="Enhanced_Agent")
+app = FastAPI(title="Smart ERP Bot", version="Final_Fixed_Agent")
 
 # =========================
 # 資料庫連線
@@ -179,13 +179,13 @@ def get_database_schema() -> str:
         return f"Error: {str(e)}"
 
 # =========================
-# 工具列表
+# 工具列表 (函式)
 # =========================
+# 這裡只放 Python 函式，Google 搜尋會在 agent_process 中動態加入
 tools_list = [execute_sql_query, create_chart, get_database_schema]
-google_search = {"google_search": {}}
 
 # =========================
-# 增強的系統提示詞
+# 系統提示詞
 # =========================
 SYSTEM_PROMPT = """你是一個智能 ERP 助理，名字是「小智」。你擁有以下能力：
 
@@ -198,8 +198,8 @@ SYSTEM_PROMPT = """你是一個智能 ERP 助理，名字是「小智」。你�
 - 可以繪製折線圖(line)、長條圖(bar)、圓餅圖(pie)
 - 繪圖時必須先用 execute_sql_query 取得資料，再用 create_chart 繪製
 
-## 🌐 網路搜尋能力
-- 可以搜尋最新資訊、新聞、天氣等
+## 🌐 網路搜尋能力 (Google Search)
+- 當用戶問的問題不在資料庫中（例如：新聞、天氣、運動比分、匯率等），請使用 google_search 工具查詢最新資訊。
 
 ## 💬 對話原則
 1. **主動積極**：不要只是回答問題，要主動提供洞察和建議
@@ -245,9 +245,16 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
         # 完整對話內容
         contents = history + [user_message]
         
-        # 配置
+        # ==========================================
+        # ✅ 修正點：使用 types.Tool 正確定義搜尋工具
+        # ==========================================
+        search_tool = types.Tool(
+            google_search=types.GoogleSearch()
+        )
+        
+        # 配置：將 Python 函式與 Google 搜尋工具合併
         config = types.GenerateContentConfig(
-            tools=tools_list,
+            tools=tools_list + [search_tool],
             system_instruction=SYSTEM_PROMPT,
             temperature=0.7
         )
@@ -261,6 +268,7 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
             turn += 1
             logger.info(f"Agent 第 {turn} 輪處理")
             
+            # 使用確認過的 gemini-2.0-flash 模型
             response = client.models.generate_content(
                 model="gemini-2.0-flash",
                 contents=contents,
@@ -310,6 +318,10 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
                             tool_result = chart_res
                     elif fc.name == "get_database_schema":
                         tool_result = get_database_schema()
+                    # Google Search 是由模型端執行，我們通常不需要手動處理它的回傳，
+                    # 但如果模型回傳了 function_call 請求搜尋，這裡會被跳過，
+                    # 因為 Google Search 是內建工具，通常會自動處理。
+                    # 如果需要手動處理，可以在這裡加邏輯，但目前的 SDK 通常自動處理。
                     else:
                         tool_result = f"未知工具: {fc.name}"
                     
@@ -334,7 +346,7 @@ async def agent_process(user_id: str, text: str, base_url: str, max_turns: int =
                 final_text = response.text
                 break
         
-        # 更新記憶（保留最近 10 輪對話）
+        # 更新記憶（保留最近 20 輪對話）
         CHAT_MEMORY[user_id] = contents[-20:]
         
         return {
@@ -464,13 +476,13 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 我可以幫你：
 📊 查詢銷售和採購數據
 📈 生成視覺化圖表
-🔍 搜尋最新資訊
+🔍 搜尋最新資訊 (如 NBA 比分、天氣)
 💡 提供商業洞察
 
 試試問我：
 • 「2024年總銷售額是多少？」
 • 「幫我畫出前十大客戶的銷售圖」
-• 「分析一下採購趨勢」
+• 「今天 NBA 勇士隊比分多少？」
 
 有任何問題都可以問我！😊"""
             
@@ -491,19 +503,17 @@ async def handle_message(user_id: str, text: str, reply_token: str, base_url: st
             help_text = """🤖 智能 ERP 助理使用說明
 
 📊 **查詢功能**
-• 直接問問題即可，例如：
-  - 2024年銷售多少？
-  - 哪個客戶買最多？
-  - 採購金額趨勢如何？
+• 2024年銷售多少？
+• 哪個客戶買最多？
+• 採購金額趨勢如何？
 
 📈 **視覺化功能**
-• 要求繪圖，例如：
-  - 畫出月銷售趨勢圖
-  - 顯示產品銷售比例
-  - 比較各年度業績
+• 畫出月銷售趨勢圖
+• 顯示產品銷售比例
 
 🔍 **搜尋功能**
-• 問任何問題，我都會盡力回答！
+• 今天 NBA 勇士隊比分？
+• 台北天氣如何？
 
 ⚙️ **指令**
 /清除記憶 - 清除對話歷史
