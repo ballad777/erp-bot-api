@@ -1,9 +1,11 @@
 import os
 import re
 import time
+import json
 import logging
 from datetime import datetime
 from typing import Dict, Any, Optional, List
+from io import BytesIO
 
 import requests
 import pandas as pd
@@ -13,7 +15,10 @@ from sqlalchemy.engine import Engine
 # =========================
 # Logging
 # =========================
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger("data_loader")
 
 # =========================
@@ -23,7 +28,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./erp.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Google Sheet URL (not local xlsx)
+# Google Sheet URL
 SALES_SHEET_URL = os.getenv("SALES_EXCEL_URL", "").strip()
 PURCHASE_SHEET_URL = os.getenv("PURCHASE_EXCEL_URL", "").strip()
 
@@ -31,18 +36,19 @@ engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 
 
 # =========================
-# DB init + dedup safe indexes
+# DB init
 # =========================
 def ensure_tables_and_indexes() -> None:
     """
-    1) Ensure tables exist
-    2) Try create unique indexes
-    3) If duplicates break index creation, auto-dedup then retry
-    4) Never crash the app for index creation failure
+    1) 確保資料表存在
+    2) 嘗試建立索引
+    3) 如果有重複資料導致索引失敗，自動去重後重試
     """
+    logger.info("🔧 檢查資料表和索引...")
     dialect = engine.url.get_backend_name()
 
     with engine.begin() as conn:
+        # 建立 sales 表
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS sales (
             date TEXT,
@@ -53,6 +59,8 @@ def ensure_tables_and_indexes() -> None:
             year INTEGER
         );
         """))
+        
+        # 建立 purchase 表
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS purchase (
             date TEXT,
@@ -65,6 +73,7 @@ def ensure_tables_and_indexes() -> None:
         """))
 
         def dedup_postgres(table: str, cols: List[str]) -> None:
+            """PostgreSQL 去重"""
             cond = " AND ".join([f"a.{c} = b.{c}" for c in cols])
             sql = f"""
             DELETE FROM {table} a
@@ -75,6 +84,7 @@ def ensure_tables_and_indexes() -> None:
             conn.execute(text(sql))
 
         def dedup_sqlite(table: str, cols: List[str]) -> None:
+            """SQLite 去重"""
             group_by = ", ".join(cols)
             sql = f"""
             DELETE FROM {table}
@@ -87,153 +97,234 @@ def ensure_tables_and_indexes() -> None:
             conn.execute(text(sql))
 
         def create_unique_index(table: str, index_name: str, cols: List[str]) -> None:
+            """建立唯一索引"""
             cols_join = ", ".join(cols)
             conn.execute(text(f"""
             CREATE UNIQUE INDEX IF NOT EXISTS {index_name}
             ON {table}({cols_join});
             """))
 
-        # sales
+        # 處理 sales 索引
         try:
-            create_unique_index("sales", "ux_sales_row", ["date", "customer", "product", "amount", "quantity"])
+            create_unique_index("sales", "ux_sales_row", 
+                              ["date", "customer", "product", "amount", "quantity"])
+            logger.info("✅ sales 索引已建立")
         except Exception as e:
-            logger.warning(f"sales unique index create failed, try dedup: {e}")
+            logger.warning(f"⚠️ sales 索引建立失敗，嘗試去重: {e}")
             try:
                 if dialect == "postgresql":
                     dedup_postgres("sales", ["date", "customer", "product", "amount", "quantity"])
                 else:
                     dedup_sqlite("sales", ["date", "customer", "product", "amount", "quantity"])
-                create_unique_index("sales", "ux_sales_row", ["date", "customer", "product", "amount", "quantity"])
-                logger.info("✅ sales dedup done, unique index created")
+                create_unique_index("sales", "ux_sales_row", 
+                                  ["date", "customer", "product", "amount", "quantity"])
+                logger.info("✅ sales 去重完成，索引已建立")
             except Exception as e2:
-                logger.error(f"❌ sales index still failed, continue without it: {e2}")
+                logger.error(f"❌ sales 索引仍然失敗，繼續執行: {e2}")
 
-        # purchase
+        # 處理 purchase 索引
         try:
-            create_unique_index("purchase", "ux_purchase_row", ["date", "supplier", "product", "amount", "quantity"])
+            create_unique_index("purchase", "ux_purchase_row", 
+                              ["date", "supplier", "product", "amount", "quantity"])
+            logger.info("✅ purchase 索引已建立")
         except Exception as e:
-            logger.warning(f"purchase unique index create failed, try dedup: {e}")
+            logger.warning(f"⚠️ purchase 索引建立失敗，嘗試去重: {e}")
             try:
                 if dialect == "postgresql":
                     dedup_postgres("purchase", ["date", "supplier", "product", "amount", "quantity"])
                 else:
                     dedup_sqlite("purchase", ["date", "supplier", "product", "amount", "quantity"])
-                create_unique_index("purchase", "ux_purchase_row", ["date", "supplier", "product", "amount", "quantity"])
-                logger.info("✅ purchase dedup done, unique index created")
+                create_unique_index("purchase", "ux_purchase_row", 
+                                  ["date", "supplier", "product", "amount", "quantity"])
+                logger.info("✅ purchase 去重完成，索引已建立")
             except Exception as e2:
-                logger.error(f"❌ purchase index still failed, continue without it: {e2}")
+                logger.error(f"❌ purchase 索引仍然失敗，繼續執行: {e2}")
 
 
 def table_counts() -> Dict[str, int]:
+    """取得各表筆數"""
     insp = inspect(engine)
     names = set(insp.get_table_names())
     out = {"sales": 0, "purchase": 0}
+    
     with engine.connect() as conn:
         for t in out.keys():
             if t in names:
-                out[t] = int(conn.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar() or 0)
+                try:
+                    result = conn.execute(text(f"SELECT COUNT(*) FROM {t}"))
+                    out[t] = int(result.scalar() or 0)
+                except:
+                    out[t] = 0
+    
     return out
 
 
 # =========================
-# Google Sheet download (export xlsx)
+# Google Sheet 下載
 # =========================
-def get_sheet_id(url: str) -> str:
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
-    if m:
-        return m.group(1)
-    m = re.search(r"id=([a-zA-Z0-9_-]+)", url)
-    return m.group(1) if m else ""
+def extract_sheet_id(url: str) -> Optional[str]:
+    """從 URL 提取 Sheet ID"""
+    patterns = [
+        r"/spreadsheets/d/([a-zA-Z0-9_-]+)",
+        r"id=([a-zA-Z0-9_-]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    return None
 
 
-def download_google_sheet_xlsx(sheet_url: str, dest_path: str, max_retries: int = 4) -> bool:
-    sheet_id = get_sheet_id(sheet_url)
+def download_google_sheet_xlsx(sheet_url: str, max_retries: int = 3) -> Optional[BytesIO]:
+    """
+    下載 Google Sheet 為 Excel 格式
+    回傳 BytesIO 或 None
+    """
+    sheet_id = extract_sheet_id(sheet_url)
     if not sheet_id:
-        logger.error("Invalid sheet url (no sheet id found).")
-        return False
+        logger.error(f"❌ 無法提取 Sheet ID: {sheet_url}")
+        return None
 
     export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export"
     params = {"format": "xlsx"}
+    
+    logger.info(f"📥 下載 Google Sheet: {sheet_id}")
 
     for attempt in range(max_retries):
         try:
-            r = requests.get(export_url, params=params, stream=True, timeout=60)
-            if r.status_code != 200:
-                logger.error(f"Sheet export failed: {r.status_code}")
-                time.sleep(min(10, 2 ** attempt))
-                continue
+            response = requests.get(
+                export_url,
+                params=params,
+                timeout=60,
+                allow_redirects=True
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"❌ HTTP {response.status_code}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return None
 
-            # xlsx is a zip file -> starts with PK
-            first2 = r.raw.read(2)
-            if first2 != b"PK":
-                logger.error("Not xlsx content (permission page/HTML?). Check sharing settings.")
-                time.sleep(min(10, 2 ** attempt))
-                continue
+            content = response.content
+            
+            # 檢查是否為 Excel (ZIP 格式，以 PK 開頭)
+            if not content.startswith(b'PK'):
+                logger.error("❌ 回應不是 Excel 格式")
+                
+                # 檢查是否為 HTML (權限問題)
+                if b'<html' in content[:500].lower():
+                    logger.error("❌ 收到 HTML，可能是權限問題")
+                    logger.error("請確認 Google Sheet 已設為「知道連結的人可以檢視」")
+                    logger.error(f"前 200 字元: {content[:200]}")
+                
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return None
+            
+            logger.info(f"✅ 下載成功: {len(content)} bytes")
+            return BytesIO(content)
 
-            with open(dest_path, "wb") as f:
-                f.write(first2)
-                for chunk in r.iter_content(32768):
-                    if chunk:
-                        f.write(chunk)
-
-            return True
+        except requests.exceptions.Timeout:
+            logger.error(f"⏱️ 下載超時 (嘗試 {attempt + 1}/{max_retries})")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
         except Exception as e:
-            logger.error(f"download error attempt {attempt + 1}: {e}")
-            time.sleep(min(10, 2 ** attempt))
+            logger.error(f"❌ 下載錯誤: {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
 
-    return False
+    return None
 
 
 # =========================
-# Normalize
+# 欄位匹配輔助函數
+# =========================
+def find_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """從候選欄位名稱中找到第一個存在的"""
+    df.columns = df.columns.astype(str).str.strip()
+    for candidate in candidates:
+        for col in df.columns:
+            if candidate in col:
+                return col
+    return None
+
+
+# =========================
+# 標準化函數（彈性版本）
 # =========================
 def normalize_sales_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    df.columns = df.columns.astype(str).str.strip()
+    """標準化銷售資料（支援多種欄位名稱）"""
+    logger.info(f"處理銷售資料，欄位: {list(df.columns)}")
+    
+    # 彈性尋找欄位
+    date_col = find_column(df, ["日期(轉換)", "日期", "Date", "date", "交易日期"])
+    customer_col = find_column(df, ["客戶供應商簡稱", "客戶簡稱", "客戶", "Customer", "客戶名稱"])
+    product_col = find_column(df, ["品名", "產品", "Product", "品號", "產品代號"])
+    quantity_col = find_column(df, ["數量", "Quantity", "銷售數量"])
+    amount_col = find_column(df, ["進銷明細未稅金額", "未稅金額", "金額", "Amount"])
 
-    # Your ERP exports usually contain these columns
-    if "日期(轉換)" not in df.columns or "進銷明細未稅金額" not in df.columns:
+    # 檢查必要欄位
+    if not all([date_col, customer_col, product_col]):
+        logger.warning(f"⚠️ 缺少必要欄位: date={date_col}, customer={customer_col}, product={product_col}")
         return None
 
+    # 建立標準化 DataFrame
     clean = pd.DataFrame({
-        "date": pd.to_datetime(df["日期(轉換)"], errors="coerce"),
-        "customer": df.get("客戶供應商簡稱", "").astype(str).str.strip(),
-        "product": df.get("品名", "").astype(str).str.strip(),
-        "quantity": pd.to_numeric(df.get("數量", 0), errors="coerce").fillna(0),
-        "amount": pd.to_numeric(df["進銷明細未稅金額"], errors="coerce").fillna(0),
+        "date": pd.to_datetime(df[date_col], errors="coerce"),
+        "customer": df[customer_col].astype(str).str.strip(),
+        "product": df[product_col].astype(str).str.strip(),
+        "quantity": pd.to_numeric(df[quantity_col], errors="coerce").fillna(0) if quantity_col else 0,
+        "amount": pd.to_numeric(df[amount_col], errors="coerce").fillna(0) if amount_col else 0,
     }).dropna(subset=["date"])
 
     clean["year"] = clean["date"].dt.year
     clean["date"] = clean["date"].dt.strftime("%Y-%m-%d")
+    
+    logger.info(f"✅ 標準化完成: {len(clean)} 筆")
     return clean
 
 
 def normalize_purchase_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    df.columns = df.columns.astype(str).str.strip()
+    """標準化採購資料（支援多種欄位名稱）"""
+    logger.info(f"處理採購資料，欄位: {list(df.columns)}")
+    
+    # 彈性尋找欄位
+    date_col = find_column(df, ["日期(轉換)", "日期", "Date", "date", "交易日期"])
+    supplier_col = find_column(df, ["客戶供應商簡稱", "供應商", "Supplier", "廠商"])
+    product_col = find_column(df, ["對方品名/品名備註", "品名", "產品", "Product", "品號"])
+    quantity_col = find_column(df, ["數量", "Quantity", "採購數量"])
+    amount_col = find_column(df, ["進銷明細未稅金額", "未稅金額", "金額", "Amount"])
 
-    if "日期(轉換)" not in df.columns or "進銷明細未稅金額" not in df.columns:
+    # 檢查必要欄位
+    if not all([date_col, supplier_col, product_col]):
+        logger.warning(f"⚠️ 缺少必要欄位: date={date_col}, supplier={supplier_col}, product={product_col}")
         return None
 
-    prod_col = "對方品名/品名備註" if "對方品名/品名備註" in df.columns else "品名"
+    # 建立標準化 DataFrame
     clean = pd.DataFrame({
-        "date": pd.to_datetime(df["日期(轉換)"], errors="coerce"),
-        "supplier": df.get("客戶供應商簡稱", "").astype(str).str.strip(),
-        "product": df.get(prod_col, "").astype(str).str.strip(),
-        "quantity": pd.to_numeric(df.get("數量", 0), errors="coerce").fillna(0),
-        "amount": pd.to_numeric(df["進銷明細未稅金額"], errors="coerce").fillna(0),
+        "date": pd.to_datetime(df[date_col], errors="coerce"),
+        "supplier": df[supplier_col].astype(str).str.strip(),
+        "product": df[product_col].astype(str).str.strip(),
+        "quantity": pd.to_numeric(df[quantity_col], errors="coerce").fillna(0) if quantity_col else 0,
+        "amount": pd.to_numeric(df[amount_col], errors="coerce").fillna(0) if amount_col else 0,
     }).dropna(subset=["date"])
 
     clean["year"] = clean["date"].dt.year
     clean["date"] = clean["date"].dt.strftime("%Y-%m-%d")
+    
+    logger.info(f"✅ 標準化完成: {len(clean)} 筆")
     return clean
 
 
 # =========================
-# Insert (idempotent)
+# 插入資料（忽略重複）
 # =========================
 def insert_ignore(kind: str, df: pd.DataFrame) -> int:
     """
-    Insert rows but ignore duplicates via unique index.
-    Note: For Postgres ON CONFLICT needs a UNIQUE constraint/index on the conflict target columns.
+    插入資料，重複的會自動忽略
+    回傳嘗試插入的筆數
     """
     if df.empty:
         return 0
@@ -254,7 +345,7 @@ def insert_ignore(kind: str, df: pd.DataFrame) -> int:
                 INSERT OR IGNORE INTO sales(date, customer, product, quantity, amount, year)
                 VALUES (:date, :customer, :product, :quantity, :amount, :year);
                 """)
-        else:
+        else:  # purchase
             if dialect == "postgresql":
                 stmt = text("""
                 INSERT INTO purchase(date, supplier, product, quantity, amount, year)
@@ -270,75 +361,86 @@ def insert_ignore(kind: str, df: pd.DataFrame) -> int:
         for r in rows:
             conn.execute(stmt, r)
 
-    # “attempted inserts” count is len(rows). Actual inserted may be less due to ignore.
     return len(rows)
 
 
 # =========================
-# Public: import from sheets
+# 主要匯入函數
 # =========================
 def import_from_sheets() -> Dict[str, Any]:
+    """從 Google Sheets 匯入資料"""
+    logger.info("🔄 開始資料匯入...")
+    
     ensure_tables_and_indexes()
 
     before = table_counts()
     messages: List[str] = []
-    ts = int(time.time())
 
-    tmp_sales = f"./_sales_{ts}.xlsx"
-    tmp_purchase = f"./_purchase_{ts}.xlsx"
-
-    # Sales
+    # 匯入銷售資料
     if SALES_SHEET_URL:
-        ok = download_google_sheet_xlsx(SALES_SHEET_URL, tmp_sales)
-        if ok:
-            xls = pd.read_excel(tmp_sales, sheet_name=None)
-            parts = []
-            for _, sdf in xls.items():
-                n = normalize_sales_df(sdf)
-                if n is not None and not n.empty:
-                    parts.append(n)
-            if parts:
-                final = pd.concat(parts, ignore_index=True)
-                insert_ignore("sales", final)
-                messages.append(f"sales: 讀到 {len(final)} 筆（增量匯入、重複會自動略過）")
-            else:
-                messages.append("sales: 沒找到符合欄位的分頁（請確認欄位是否包含：日期(轉換)、進銷明細未稅金額）")
+        logger.info("📊 處理銷售資料...")
+        excel_bytes = download_google_sheet_xlsx(SALES_SHEET_URL)
+        
+        if excel_bytes:
+            try:
+                xls = pd.read_excel(excel_bytes, sheet_name=None)
+                logger.info(f"找到 {len(xls)} 個工作表")
+                
+                parts = []
+                for sheet_name, df in xls.items():
+                    logger.info(f"處理工作表: {sheet_name}")
+                    normalized = normalize_sales_df(df)
+                    if normalized is not None and not normalized.empty:
+                        parts.append(normalized)
+                
+                if parts:
+                    final = pd.concat(parts, ignore_index=True)
+                    insert_ignore("sales", final)
+                    messages.append(f"✅ sales: 讀到 {len(final)} 筆（增量匯入，重複會自動略過）")
+                else:
+                    messages.append("⚠️ sales: 沒找到符合欄位的分頁")
+            except Exception as e:
+                logger.error(f"❌ sales 處理錯誤: {str(e)}", exc_info=True)
+                messages.append(f"❌ sales: 處理失敗 - {str(e)}")
         else:
-            messages.append("sales: 下載失敗（請確認 Google Sheet 已設為「知道連結的人可檢視」）")
+            messages.append("❌ sales: 下載失敗（請確認 Google Sheet 已設為「知道連結的人可檢視」）")
     else:
-        messages.append("sales: 未設定 SALES_EXCEL_URL")
+        messages.append("ℹ️ sales: 未設定 SALES_EXCEL_URL")
 
-    # Purchase
+    # 匯入採購資料
     if PURCHASE_SHEET_URL:
-        ok = download_google_sheet_xlsx(PURCHASE_SHEET_URL, tmp_purchase)
-        if ok:
-            xls = pd.read_excel(tmp_purchase, sheet_name=None)
-            parts = []
-            for _, pdf in xls.items():
-                n = normalize_purchase_df(pdf)
-                if n is not None and not n.empty:
-                    parts.append(n)
-            if parts:
-                final = pd.concat(parts, ignore_index=True)
-                insert_ignore("purchase", final)
-                messages.append(f"purchase: 讀到 {len(final)} 筆（增量匯入、重複會自動略過）")
-            else:
-                messages.append("purchase: 沒找到符合欄位的分頁（請確認欄位是否包含：日期(轉換)、進銷明細未稅金額）")
+        logger.info("📦 處理採購資料...")
+        excel_bytes = download_google_sheet_xlsx(PURCHASE_SHEET_URL)
+        
+        if excel_bytes:
+            try:
+                xls = pd.read_excel(excel_bytes, sheet_name=None)
+                logger.info(f"找到 {len(xls)} 個工作表")
+                
+                parts = []
+                for sheet_name, df in xls.items():
+                    logger.info(f"處理工作表: {sheet_name}")
+                    normalized = normalize_purchase_df(df)
+                    if normalized is not None and not normalized.empty:
+                        parts.append(normalized)
+                
+                if parts:
+                    final = pd.concat(parts, ignore_index=True)
+                    insert_ignore("purchase", final)
+                    messages.append(f"✅ purchase: 讀到 {len(final)} 筆（增量匯入，重複會自動略過）")
+                else:
+                    messages.append("⚠️ purchase: 沒找到符合欄位的分頁")
+            except Exception as e:
+                logger.error(f"❌ purchase 處理錯誤: {str(e)}", exc_info=True)
+                messages.append(f"❌ purchase: 處理失敗 - {str(e)}")
         else:
-            messages.append("purchase: 下載失敗（請確認 Google Sheet 已設為「知道連結的人可檢視」）")
+            messages.append("❌ purchase: 下載失敗（請確認 Google Sheet 已設為「知道連結的人可檢視」）")
     else:
-        messages.append("purchase: 未設定 PURCHASE_EXCEL_URL")
-
-    # cleanup
-    for p in [tmp_sales, tmp_purchase]:
-        try:
-            if os.path.exists(p):
-                os.remove(p)
-        except Exception:
-            pass
+        messages.append("ℹ️ purchase: 未設定 PURCHASE_EXCEL_URL")
 
     after = table_counts()
-    return {
+    
+    result = {
         "ok": True,
         "before": before,
         "after": after,
@@ -346,8 +448,11 @@ def import_from_sheets() -> Dict[str, Any]:
         "db": engine.url.get_backend_name(),
         "time": datetime.utcnow().isoformat() + "Z",
     }
+    
+    logger.info(f"✨ 資料匯入完成: {result}")
+    return result
 
 
 if __name__ == "__main__":
     result = import_from_sheets()
-    logger.info(json.dumps(result, ensure_ascii=False))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
