@@ -6,7 +6,6 @@ import hmac
 import base64
 import hashlib
 import logging
-import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
@@ -24,17 +23,20 @@ from sqlalchemy.engine import Engine
 from google import genai
 from google.genai import types
 
-# =========================
+# =========================================================
 # Logging
-# =========================
+# =========================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("erp_ultra_pro")
 
-app = FastAPI(title="ERP Bot Ultra PRO", version="3.0_Commercial")
+# =========================================================
+# App
+# =========================================================
+app = FastAPI(title="ERP Bot Ultra PRO", version="3.1_Commercial_Hardened")
 
-# =========================
+# =========================================================
 # Environment
-# =========================
+# =========================================================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./erp.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -48,26 +50,29 @@ MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 SALES_SHEET_URL = os.getenv("SALES_EXCEL_URL", "")
 PURCHASE_SHEET_URL = os.getenv("PURCHASE_EXCEL_URL", "")
 
-# Admin protect for reload
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # REQUIRED for /admin/*
 AUTO_IMPORT_ON_STARTUP = os.getenv("AUTO_IMPORT_ON_STARTUP", "0") == "1"
 
-# basic anti-spam
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "40"))
-RATE_STORE: Dict[str, List[float]] = {}
 
+# =========================================================
+# Globals
+# =========================================================
 engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# =========================
+RATE_STORE: Dict[str, List[float]] = {}
+DB_READY = False
+
+# =========================================================
 # Time utils
-# =========================
+# =========================================================
 def now_taipei() -> datetime:
     return datetime.utcnow() + timedelta(hours=8)
 
-# =========================
+# =========================================================
 # Security utils
-# =========================
+# =========================================================
 def verify_line_signature(body: bytes, signature: str):
     if not LINE_CHANNEL_SECRET:
         return
@@ -95,10 +100,18 @@ def rate_limit_ok(user_id: str) -> bool:
     RATE_STORE[user_id] = ts
     return True
 
-# =========================
-# DB init (tables + unique index for de-dup)
-# =========================
+# =========================================================
+# DB init + dedup + indexes (never crash startup)
+# =========================================================
 def ensure_tables():
+    """
+    商用強化版：
+    - 建表
+    - 建 unique index（若資料已重複 -> 先自動去重再建）
+    - 就算 index 還是失敗，也不讓服務啟動掛掉
+    """
+    dialect = engine.url.get_backend_name()
+
     with engine.begin() as conn:
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS sales (
@@ -120,14 +133,60 @@ def ensure_tables():
             year INTEGER
         );
         """))
-        conn.execute(text("""
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_sales_row
-        ON sales(date, customer, product, amount, quantity);
-        """))
-        conn.execute(text("""
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_purchase_row
-        ON purchase(date, supplier, product, amount, quantity);
-        """))
+
+        def dedup_postgres(table: str, cols: List[str]):
+            cond = " AND ".join([f"a.{c} = b.{c}" for c in cols])
+            sql = f"""
+            DELETE FROM {table} a
+            USING {table} b
+            WHERE {cond}
+              AND a.ctid > b.ctid;
+            """
+            conn.execute(text(sql))
+
+        def dedup_sqlite(table: str, cols: List[str]):
+            group_by = ", ".join(cols)
+            sql = f"""
+            DELETE FROM {table}
+            WHERE rowid NOT IN (
+                SELECT MIN(rowid)
+                FROM {table}
+                GROUP BY {group_by}
+            );
+            """
+            conn.execute(text(sql))
+
+        def create_unique_index(table: str, index_name: str, cols: List[str]):
+            cols_join = ", ".join(cols)
+            conn.execute(text(f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS {index_name}
+            ON {table}({cols_join});
+            """))
+
+        def ensure_unique(table: str, index_name: str, cols: List[str]):
+            try:
+                create_unique_index(table, index_name, cols)
+                return
+            except Exception as e:
+                logger.error(f"{table} unique index create failed, auto-dedup... err={e}")
+                try:
+                    if dialect == "postgresql":
+                        dedup_postgres(table, cols)
+                    else:
+                        dedup_sqlite(table, cols)
+                    create_unique_index(table, index_name, cols)
+                    logger.info(f"✅ {table} auto-dedup done, unique index created")
+                except Exception as e2:
+                    logger.error(f"❌ {table} index still failed, continue without unique index. err={e2}")
+
+        ensure_unique("sales", "ux_sales_row", ["date", "customer", "product", "amount", "quantity"])
+        ensure_unique("purchase", "ux_purchase_row", ["date", "supplier", "product", "amount", "quantity"])
+
+def require_db_ready():
+    global DB_READY
+    if not DB_READY:
+        ensure_tables()
+        DB_READY = True
 
 def table_counts() -> Dict[str, int]:
     insp = inspect(engine)
@@ -139,14 +198,13 @@ def table_counts() -> Dict[str, int]:
                 out[t] = int(conn.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar() or 0)
     return out
 
-# =========================
-# Google Sheet download (stable): export xlsx
-# =========================
+# =========================================================
+# Google Sheet download (xlsx export)
+# =========================================================
 def get_sheet_id(url: str) -> str:
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
     if m:
         return m.group(1)
-    # also accept id= form
     m = re.search(r"id=([a-zA-Z0-9_-]+)", url)
     return m.group(1) if m else ""
 
@@ -160,33 +218,35 @@ def download_google_sheet_xlsx(sheet_url: str, dest_path: str, max_retries: int 
 
     for attempt in range(max_retries):
         try:
-            r = requests.get(export_url, params=params, stream=True, timeout=60)
-            if r.status_code != 200:
-                logger.error(f"Sheet export failed: {r.status_code}")
-                time.sleep(min(10, 2 ** attempt))
-                continue
+            with requests.get(export_url, params=params, stream=True, timeout=60) as r:
+                if r.status_code != 200:
+                    logger.error(f"Sheet export failed: {r.status_code}")
+                    time.sleep(min(10, 2 ** attempt))
+                    continue
 
-            # xlsx is zip -> starts with PK
-            first2 = r.raw.read(2)
-            if first2 != b"PK":
-                logger.error("Not xlsx content (permission page/HTML?)")
-                time.sleep(min(10, 2 ** attempt))
-                continue
+                # xlsx should start with PK
+                first2 = r.raw.read(2)
+                if first2 != b"PK":
+                    logger.error("Not xlsx content (permission page/HTML?)")
+                    time.sleep(min(10, 2 ** attempt))
+                    continue
 
-            with open(dest_path, "wb") as f:
-                f.write(first2)
-                for chunk in r.iter_content(32768):
-                    if chunk:
-                        f.write(chunk)
+                with open(dest_path, "wb") as f:
+                    f.write(first2)
+                    for chunk in r.iter_content(32768):
+                        if chunk:
+                            f.write(chunk)
             return True
+
         except Exception as e:
             logger.error(f"download error attempt {attempt+1}: {e}")
             time.sleep(min(10, 2 ** attempt))
+
     return False
 
-# =========================
-# ETL: normalize sheets
-# =========================
+# =========================================================
+# ETL normalize
+# =========================================================
 def normalize_sales_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     df.columns = df.columns.astype(str).str.strip()
     if "日期(轉換)" not in df.columns or "進銷明細未稅金額" not in df.columns:
@@ -222,46 +282,58 @@ def normalize_purchase_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     clean["date"] = clean["date"].dt.strftime("%Y-%m-%d")
     return clean
 
+# =========================================================
+# Upsert (true inserted count)
+# =========================================================
 def upsert_rows(kind: str, rows: List[Dict[str, Any]]) -> int:
-    dialect = engine.url.get_backend_name()
-    inserted = 0
+    if not rows:
+        return 0
 
+    dialect = engine.url.get_backend_name()
     with engine.begin() as conn:
         if kind == "sales":
             if dialect == "postgresql":
                 stmt = text("""
                 INSERT INTO sales(date, customer, product, quantity, amount, year)
                 VALUES (:date, :customer, :product, :quantity, :amount, :year)
-                ON CONFLICT (date, customer, product, amount, quantity) DO NOTHING;
+                ON CONFLICT (date, customer, product, amount, quantity) DO NOTHING
+                RETURNING 1;
                 """)
+                res = conn.execute(stmt, rows).fetchall()
+                return len(res)
             else:
                 stmt = text("""
                 INSERT OR IGNORE INTO sales(date, customer, product, quantity, amount, year)
                 VALUES (:date, :customer, :product, :quantity, :amount, :year);
                 """)
+                res = conn.execute(stmt, rows)
+                return int(res.rowcount or 0)
+
         else:
             if dialect == "postgresql":
                 stmt = text("""
                 INSERT INTO purchase(date, supplier, product, quantity, amount, year)
                 VALUES (:date, :supplier, :product, :quantity, :amount, :year)
-                ON CONFLICT (date, supplier, product, amount, quantity) DO NOTHING;
+                ON CONFLICT (date, supplier, product, amount, quantity) DO NOTHING
+                RETURNING 1;
                 """)
+                res = conn.execute(stmt, rows).fetchall()
+                return len(res)
             else:
                 stmt = text("""
                 INSERT OR IGNORE INTO purchase(date, supplier, product, quantity, amount, year)
                 VALUES (:date, :supplier, :product, :quantity, :amount, :year);
                 """)
-
-        for r in rows:
-            conn.execute(stmt, r)
-            inserted += 1
-
-    return inserted
+                res = conn.execute(stmt, rows)
+                return int(res.rowcount or 0)
 
 def import_data_to_db() -> Dict[str, Any]:
-    ensure_tables()
+    require_db_ready()
+
+    t0 = time.time()
     before = table_counts()
     msgs = []
+    inserted = {"sales": 0, "purchase": 0}
 
     tmp_sales = f"./_sales_{int(time.time())}.xlsx"
     tmp_purchase = f"./_purchase_{int(time.time())}.xlsx"
@@ -277,8 +349,8 @@ def import_data_to_db() -> Dict[str, Any]:
                     dfs.append(n)
             if dfs:
                 final = pd.concat(dfs, ignore_index=True)
-                upsert_rows("sales", final.to_dict(orient="records"))
-                msgs.append(f"sales: 讀到 {len(final)} 筆，已嘗試增量匯入")
+                inserted["sales"] = upsert_rows("sales", final.to_dict(orient="records"))
+                msgs.append(f"sales: 讀到 {len(final)} 筆，實際新增 {inserted['sales']} 筆")
             else:
                 msgs.append("sales: 沒找到符合欄位的分頁")
         else:
@@ -297,8 +369,8 @@ def import_data_to_db() -> Dict[str, Any]:
                     dfs.append(n)
             if dfs:
                 final = pd.concat(dfs, ignore_index=True)
-                upsert_rows("purchase", final.to_dict(orient="records"))
-                msgs.append(f"purchase: 讀到 {len(final)} 筆，已嘗試增量匯入")
+                inserted["purchase"] = upsert_rows("purchase", final.to_dict(orient="records"))
+                msgs.append(f"purchase: 讀到 {len(final)} 筆，實際新增 {inserted['purchase']} 筆")
             else:
                 msgs.append("purchase: 沒找到符合欄位的分頁")
         else:
@@ -315,14 +387,20 @@ def import_data_to_db() -> Dict[str, Any]:
             pass
 
     after = table_counts()
-    return {"ok": True, "before": before, "after": after, "messages": msgs}
+    cost = time.time() - t0
+    return {
+        "ok": True,
+        "before": before,
+        "after": after,
+        "inserted": inserted,
+        "seconds": round(cost, 2),
+        "messages": msgs
+    }
 
-# =========================
-# LLM: ONLY output a JSON plan (no SQL)
-# =========================
+# =========================================================
+# LLM plan (strict JSON)
+# =========================================================
 PLAN_SYSTEM = """你是 ERP 問題解析器。你只能輸出 JSON（不要任何多餘文字）。
-把使用者問題轉成查詢計畫。
-
 輸出 schema：
 {
   "table": "sales" | "purchase",
@@ -354,7 +432,13 @@ class Plan:
     year: Optional[int]
     limit: int
 
+def extract_json_object(s: str) -> str:
+    s = (s or "").strip()
+    m = re.search(r"\{.*\}", s, re.DOTALL)
+    return m.group(0) if m else ""
+
 def parse_plan(user_text: str) -> Plan:
+    # no API -> basic fallback
     if not client:
         return Plan("sales", "amount", "detail", "", None, 10)
 
@@ -367,7 +451,7 @@ def parse_plan(user_text: str) -> Plan:
         config=types.GenerateContentConfig(system_instruction=PLAN_SYSTEM, temperature=0.1)
     )
 
-    raw = (resp.text or "").strip()
+    raw = extract_json_object((resp.text or "").strip())
     try:
         obj = json.loads(raw)
     except:
@@ -404,9 +488,9 @@ def parse_plan(user_text: str) -> Plan:
 
     return Plan(table, metric, agg, keyword, year, limit)
 
-# =========================
+# =========================================================
 # SAFE SQL templates
-# =========================
+# =========================================================
 def build_where(plan: Plan) -> Tuple[str, Dict[str, Any]]:
     params: Dict[str, Any] = {}
     where = []
@@ -416,11 +500,14 @@ def build_where(plan: Plan) -> Tuple[str, Dict[str, Any]]:
         params["year"] = plan.year
 
     if plan.keyword:
-        params["kw"] = f"%{plan.keyword}%"
-        if plan.table == "sales":
-            where.append("(customer LIKE :kw OR product LIKE :kw)")
-        else:
-            where.append("(supplier LIKE :kw OR product LIKE :kw)")
+        # allow up to 3 tokens for stronger matching
+        tokens = [t for t in re.split(r"[\s,，]+", plan.keyword) if t.strip()][:3]
+        for i, tok in enumerate(tokens):
+            params[f"kw{i}"] = f"%{tok}%"
+            if plan.table == "sales":
+                where.append(f"(customer LIKE :kw{i} OR product LIKE :kw{i})")
+            else:
+                where.append(f"(supplier LIKE :kw{i} OR product LIKE :kw{i})")
 
     clause = " WHERE " + " AND ".join(where) if where else ""
     return clause, params
@@ -429,15 +516,9 @@ def run_df(sql: str, params: Dict[str, Any]) -> pd.DataFrame:
     with engine.connect() as conn:
         return pd.read_sql(text(sql), conn, params=params)
 
-def format_text(df: pd.DataFrame) -> str:
-    # LINE-friendly simple text
-    lines = []
-    for _, r in df.iterrows():
-        lines.append(" - " + " | ".join(str(x) for x in r.tolist()))
-    return "\n".join(lines)
-
 def answer_from_plan(user_text: str) -> str:
-    ensure_tables()
+    require_db_ready()
+
     counts = table_counts()
     if counts["sales"] == 0 and counts["purchase"] == 0:
         return "目前資料庫沒有資料，請先匯入 Google Sheet。"
@@ -471,8 +552,9 @@ def answer_from_plan(user_text: str) -> str:
             ORDER BY value DESC
             LIMIT :limit;
         """, p)
-        if df.empty:
-            # relax: remove year once
+
+        # relax once (drop year) if empty
+        if df.empty and plan.year:
             relaxed = Plan(plan.table, plan.metric, plan.agg, plan.keyword, None, plan.limit)
             where2, params2 = build_where(relaxed)
             p2 = dict(params2); p2["limit"] = plan.limit
@@ -484,8 +566,9 @@ def answer_from_plan(user_text: str) -> str:
                 ORDER BY value DESC
                 LIMIT :limit;
             """, p2)
-            if df.empty:
-                return "查不到資料。建議：縮短關鍵字或先不要指定年份。"
+
+        if df.empty:
+            return "查不到資料。建議：縮短關鍵字或先不要指定年份。"
 
         lines = [f"Top {len(df)} {party_label}（依{value_label}）"]
         lines += [f" - {r['name']}: {float(r['value']):,.2f}" for _, r in df.iterrows()]
@@ -538,9 +621,10 @@ def answer_from_plan(user_text: str) -> str:
             return "查不到明細。建議：縮短關鍵字或先不要指定年份。"
         lines = ["最新銷售明細（最多顯示前幾筆）"]
         for _, r in df.iterrows():
-            lines.append(f" - {r['date']} | {r['customer']} | {r['product']} | 數量 {float(r['quantity']):,.2f} | 金額 {float(r['amount']):,.2f}")
+            lines.append(
+                f" - {r['date']} | {r['customer']} | {r['product']} | 數量 {float(r['quantity']):,.2f} | 金額 {float(r['amount']):,.2f}"
+            )
         return "\n".join(lines)
-
     else:
         df = run_df(f"""
             SELECT date, supplier, product, quantity, amount
@@ -553,12 +637,14 @@ def answer_from_plan(user_text: str) -> str:
             return "查不到明細。建議：縮短關鍵字或先不要指定年份。"
         lines = ["最新採購明細（最多顯示前幾筆）"]
         for _, r in df.iterrows():
-            lines.append(f" - {r['date']} | {r['supplier']} | {r['product']} | 數量 {float(r['quantity']):,.2f} | 金額 {float(r['amount']):,.2f}")
+            lines.append(
+                f" - {r['date']} | {r['supplier']} | {r['product']} | 數量 {float(r['quantity']):,.2f} | 金額 {float(r['amount']):,.2f}"
+            )
         return "\n".join(lines)
 
-# =========================
+# =========================================================
 # LINE reply
-# =========================
+# =========================================================
 async def reply_line(reply_token: str, text_out: str):
     if not LINE_CHANNEL_ACCESS_TOKEN:
         return
@@ -570,16 +656,16 @@ async def reply_line(reply_token: str, text_out: str):
     async with httpx.AsyncClient(timeout=20) as c:
         await c.post("https://api.line.me/v2/bot/message/reply", headers=headers, json=payload)
 
-# =========================
-# API routes
-# =========================
+# =========================================================
+# Routes
+# =========================================================
 @app.get("/")
 def root():
     return {"status": "ok", "service": "ERP Bot Ultra PRO"}
 
 @app.get("/health")
 def health():
-    ensure_tables()
+    require_db_ready()
     return {"status": "ok", "counts": table_counts()}
 
 @app.post("/admin/reload_sync")
@@ -605,7 +691,6 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             reply_token = event["replyToken"]
 
             if user_text.strip().lower() in ["/reset", "清除"]:
-                # no conversation memory needed for this pro design
                 background_tasks.add_task(reply_line, reply_token, "已清除（本版本不依賴長對話記憶）")
                 continue
 
@@ -627,7 +712,13 @@ async def handle_message(user_text: str, reply_token: str):
 
 @app.on_event("startup")
 async def startup():
-    ensure_tables()
+    global DB_READY
+    try:
+        ensure_tables()
+        DB_READY = True
+    except Exception as e:
+        logger.error(f"startup ensure_tables error (continue): {e}")
+
     if AUTO_IMPORT_ON_STARTUP:
         try:
             import_data_to_db()
