@@ -53,7 +53,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 # 支援多種 URL 格式
 SALES_SHEET_URL = os.getenv("SALES_EXCEL_URL", "")
