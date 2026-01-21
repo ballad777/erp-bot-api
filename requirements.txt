@@ -1,30 +1,5 @@
-# FastAPI 框架
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-
-# 資料庫
-sqlalchemy==2.0.34
-psycopg2-binary==2.9.9
-
-# 資料處理
-pandas==2.2.2
-openpyxl==3.1.5
-
-# HTTP 客戶端
-requests==2.32.3
-httpx==0.27.2
-
-# 環境變數
-python-dotenv==1.0.1
-
-# Google Gemini AI
-google-genai==0.3.0
-
-# 檔案上傳
-python-multipart==0.0.9
-
-# 排程（可選）
-apscheduler==3.10.4
-
-# 圖表繪製（必要！）
-matplotlib==3.9.2
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.18.0
+openpyxl>=3.1.0
